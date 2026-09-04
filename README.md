@@ -64,7 +64,8 @@ omarchy plugin add https://github.com/nixfred/sonomarchy.git --enable
 ```
 
 Then open the audio panel: your zones are in the output list. Nothing else to
-configure.
+configure. Discovery is SSDP, so zones trickle in over the first minute after
+login or a network change rather than all at once.
 
 If you previously ran pa-dlna as a systemd user service, stop it first —
 pa-dlna refuses to run twice and the plugin will tell you:
