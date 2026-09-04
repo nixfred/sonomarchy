@@ -45,12 +45,15 @@ not control playback, groups or volume on the speakers. For that, pair it with
 
 The **speaker pulls audio from your computer**. With a default-deny firewall
 (ufw on a stock install) that connection is dropped and you get silence with
-no error. Allow the two ports from your LAN (adjust the subnet):
+no error. Allow the two ports from your LAN — as root, adjusting the subnet:
 
 ```bash
-sudo ufw allow proto tcp from 192.168.1.0/24 to any port 8080 comment 'Sonomarchy stream'
-sudo ufw allow proto udp from 192.168.1.0/24 to any port 8081 comment 'Sonomarchy discovery'
+ufw allow proto tcp from 192.168.1.0/24 to any port 8080 comment 'Sonomarchy stream'
+ufw allow proto udp from 192.168.1.0/24 to any port 8081 comment 'Sonomarchy discovery'
 ```
+
+The plugin itself never touches the firewall or asks for elevated rights;
+these rules are yours to add once.
 
 8080/tcp is where the speakers fetch the stream (the first free port from
 8080–8089 is used; the OSD tells you which if it isn't 8080). 8081/udp is where
@@ -67,12 +70,9 @@ Then open the audio panel: your zones are in the output list. Nothing else to
 configure. Discovery is SSDP, so zones trickle in over the first minute after
 login or a network change rather than all at once.
 
-If you previously ran pa-dlna as a systemd user service, stop it first —
-pa-dlna refuses to run twice and the plugin will tell you:
-
-```bash
-systemctl --user disable --now pa-dlna.service
-```
+If you already run pa-dlna yourself (by hand, or as a user service from a
+manual install), stop and disable it first — pa-dlna refuses to run twice, and
+the plugin will say so rather than fail silently.
 
 ## Behaviour worth knowing
 

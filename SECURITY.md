@@ -19,8 +19,8 @@
 ## What it does not do
 
 - No Sonos account, no cloud, no telemetry.
-- No privilege escalation; it never calls sudo. Firewall rules are yours to
-  add (see README).
+- No sudo or pkexec is required, and none is ever invoked. Firewall rules are
+  yours to add as root (see README).
 - Never writes inside the plugin directory.
 
 ## Dependencies

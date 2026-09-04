@@ -44,11 +44,12 @@ command -v parec >/dev/null 2>&1 \
 command -v lame >/dev/null 2>&1 || command -v ffmpeg >/dev/null 2>&1 \
   || setup_error "An MP3 encoder is missing: install lame (or ffmpeg)."
 
-# pa-dlna refuses to start twice. A leftover systemd unit from a manual
-# install would make every backend start die instantly with a confusing
-# message, so name the fix.
-if systemctl --user is-active --quiet pa-dlna.service 2>/dev/null; then
-  setup_error "pa-dlna.service is running and Sonomarchy replaces it. Run: systemctl --user disable --now pa-dlna.service"
+# pa-dlna refuses to start twice. A pa-dlna the user runs by hand (or left
+# behind as a user service from a manual install) would make every backend
+# start die instantly with a confusing message, so detect it the way pa-dlna
+# does -- a live PulseAudio client named pa-dlna -- and name the fix.
+if pactl list clients 2>/dev/null | grep -q 'application.name = "pa-dlna"'; then
+  setup_error "Another pa-dlna is already running (manual install or user service). Stop and disable it; Sonomarchy replaces it."
 fi
 
 # --------------------------------------------------------------------- venv
