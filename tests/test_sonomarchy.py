@@ -210,6 +210,70 @@ class Emit(unittest.TestCase):
         self.assertEqual(json.loads(line), {'type': 'zone', 'uuid': 'RINCON_A', 'name': 'Office (Sonos Playbar)'})
 
 
+class StaleSinkCleanup(unittest.TestCase):
+    # `pactl list short modules` is tab-separated: index, name, argument.
+    MODULES = '\n'.join([
+        '5\tmodule-alsa-card\tdevice_id=0',
+        '536870916\tmodule-null-sink\tsink_name="Sonos Play:1-uuid:RINCON_000E58A0B1C201400_MR" sink_properties=device.description="Den (Sonos Play:1)"',
+        '536870917\tmodule-null-sink\tsink_name="easyeffects_sink"',
+        '536870918\tmodule-null-sink\tsink_name="Sonos Playbar-uuid:RINCON_000E58A0B1C301400_MR"',
+        '536870919\tmodule-null-sink',
+    ])
+    CLIENTS_WITH_PA_DLNA = 'Client #80839\n\tDriver: PipeWire\n\tProperties:\n\t\tapplication.name = "pa-dlna"\n'
+    CLIENTS_WITHOUT = 'Client #12\n\tProperties:\n\t\tapplication.name = "Firefox"\n'
+
+    def fake_pactl(self, clients_text, calls):
+        class FakeRun:
+            def __init__(self, stdout): self.stdout = stdout
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd == ['pactl', 'list', 'clients']:
+                return FakeRun(clients_text)
+            if cmd == ['pactl', 'list', 'short', 'modules']:
+                return FakeRun(self.MODULES)
+            return FakeRun('')
+        return fake_run
+
+    def test_only_sonos_null_sinks_are_stale(self):
+        m = load()
+        self.assertEqual(m._stale_null_sink_modules(self.MODULES), [536870916, 536870918])
+        self.assertEqual(m._stale_null_sink_modules(''), [])
+        self.assertEqual(m._stale_null_sink_modules(None), [])
+
+    def test_client_detection(self):
+        m = load()
+        self.assertTrue(m._pa_dlna_client_alive(self.CLIENTS_WITH_PA_DLNA))
+        self.assertFalse(m._pa_dlna_client_alive(self.CLIENTS_WITHOUT))
+        self.assertFalse(m._pa_dlna_client_alive(''))
+
+    def test_cleanup_skipped_while_another_instance_runs(self):
+        m = load()
+        calls = []
+        import subprocess
+        original = subprocess.run
+        subprocess.run = self.fake_pactl(self.CLIENTS_WITH_PA_DLNA, calls)
+        try:
+            self.assertEqual(m._unload_stale_sinks(), 0)
+        finally:
+            subprocess.run = original
+        self.assertFalse(any(c[:2] == ['pactl', 'unload-module'] for c in calls))
+
+    def test_cleanup_unloads_exactly_the_stale_ones(self):
+        m = load()
+        calls = []
+        import subprocess
+        original = subprocess.run
+        subprocess.run = self.fake_pactl(self.CLIENTS_WITHOUT, calls)
+        m.emit = lambda *a, **k: None
+        try:
+            self.assertEqual(m._unload_stale_sinks(), 2)
+        finally:
+            subprocess.run = original
+        unloaded = [c[2] for c in calls if c[:2] == ['pactl', 'unload-module']]
+        self.assertEqual(unloaded, ['536870916', '536870918'])
+
+
 class ArgvParsing(unittest.TestCase):
     def test_nics_forms(self):
         m = load()

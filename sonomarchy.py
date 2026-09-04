@@ -525,9 +525,68 @@ def _renderer_init(self, *args, **kwargs):
 _pa_dlna.Renderer.__init__ = _renderer_init
 
 
+# ===========================================================================
+# FIX 9 - clean up sinks a previous backend left behind
+# ===========================================================================
+# `omarchy plugin update` makes the shell reload the plugin; the old backend is
+# torn down before pa-dlna can unload its null-sink modules. A crash does the
+# same. The leftovers then sit in the sound menu as duplicate, dead zones next
+# to the live ones. pa-dlna's own single-instance check counts live PulseAudio
+# clients, so it neither notices nor removes them.
+#
+# Only done when no pa-dlna client is alive: a running instance's sinks are
+# in use, and it will refuse to let us start anyway.
+def _stale_null_sink_modules(short_modules):
+    """Indices of pa-dlna Sonos null-sinks in `pactl list short modules` text.
+
+    Text on purpose: PipeWire's pactl reports every module's index as null in
+    `-f json` output, while the tab-separated short listing has been stable
+    across PulseAudio and PipeWire for years.
+    """
+    stale = []
+    for line in (short_modules or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) < 2 or parts[1] != 'module-null-sink':
+            continue
+        argument = parts[2] if len(parts) > 2 else ''
+        if 'uuid:RINCON_' in argument and parts[0].strip().isdigit():
+            stale.append(int(parts[0]))
+    return stale
+
+
+def _pa_dlna_client_alive(clients_text):
+    """True if `pactl list clients` shows a client named pa-dlna."""
+    return 'application.name = "pa-dlna"' in (clients_text or '')
+
+
+def _unload_stale_sinks():
+    import subprocess
+
+    def pactl(*args):
+        return subprocess.run(['pactl', *args], capture_output=True,
+                              text=True, timeout=5).stdout or ''
+
+    try:
+        if _pa_dlna_client_alive(pactl('list', 'clients')):
+            return 0
+        stale = _stale_null_sink_modules(pactl('list', 'short', 'modules'))
+        for index in stale:
+            subprocess.run(['pactl', 'unload-module', str(index)],
+                           capture_output=True, timeout=5)
+        if stale:
+            logger.warning(f'unloaded {len(stale)} stale Sonos null-sink(s) '
+                           f'left behind by a previous backend')
+            emit('cleanup', unloaded=len(stale))
+        return len(stale)
+    except Exception as e:
+        logger.debug(f'stale sink cleanup skipped: {e!r}')
+        return 0
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     emit('starting', version=VERSION)
+    _unload_stale_sinks()
     threading.Thread(target=_watch_addresses,
                      args=(_nics_from_argv(argv),),
                      name='address-watch',

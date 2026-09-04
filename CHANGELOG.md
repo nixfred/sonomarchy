@@ -14,5 +14,6 @@ First release.
 - Takes over a zone held by Spotify Connect instead of silently doing nothing.
 - Seamless track changes (10 s grace instead of pa-dlna's 2 s).
 - Detects a firewall blocking the stream and says which port to open.
+- Removes null-sinks a previous backend left behind (plugin update, crash).
 - Hash-locked Python backend in a private venv; picks a free port; finds the
   right network interfaces on any machine.
