@@ -1,0 +1,109 @@
+#!/bin/bash
+# Sonomarchy backend launcher.
+#
+# Builds (once) an isolated Python environment from the hash-locked
+# requirements, checks every runtime dependency with a readable message, works
+# out which interfaces and ports to use on THIS machine, then execs the
+# backend. Service.qml runs this; it is not meant to be run by hand, but it is
+# harmless to.
+#
+# Everything writable lives under XDG dirs, never inside the plugin folder:
+# Omarchy rebuilds plugin services when a plugin writes into its own directory.
+set -euo pipefail
+
+PLUGIN_ID="io.github.nixfred.sonomarchy"
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/${PLUGIN_ID}"
+VENV_DIR="${DATA_DIR}/venv"
+LOCK_FILE="${DATA_DIR}/setup.lock"
+REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
+PYTHON_BIN="${SONOMARCHY_PYTHON:-python3}"
+
+# The UDP port SSDP replies come back on must be fixed so it can be allowed
+# through a firewall. The TCP port the speakers pull audio from is the first
+# free one in a small range; TCP and UDP namespaces are separate so 8081 can be
+# both. Override with SONOMARCHY_HTTP_PORT / SONOMARCHY_SSDP_PORT.
+SSDP_PORT="${SONOMARCHY_SSDP_PORT:-8081}"
+HTTP_PORT_FIRST="${SONOMARCHY_HTTP_PORT:-8080}"
+HTTP_PORT_LAST=8089
+
+setup_error() {
+  printf 'SONOMARCHY_SETUP_ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------- dependencies
+command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+  || setup_error "python3 is required."
+"$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' \
+  || setup_error "Python 3.9 or newer is required."
+"$PYTHON_BIN" -c 'import venv' 2>/dev/null \
+  || setup_error "The python venv module is missing (package: python)."
+command -v parec >/dev/null 2>&1 \
+  || setup_error "parec is missing (package: libpulse)."
+command -v lame >/dev/null 2>&1 || command -v ffmpeg >/dev/null 2>&1 \
+  || setup_error "An MP3 encoder is missing: install lame (or ffmpeg)."
+
+# pa-dlna refuses to start twice. A leftover systemd unit from a manual
+# install would make every backend start die instantly with a confusing
+# message, so name the fix.
+if systemctl --user is-active --quiet pa-dlna.service 2>/dev/null; then
+  setup_error "pa-dlna.service is running and Sonomarchy replaces it. Run: systemctl --user disable --now pa-dlna.service"
+fi
+
+# --------------------------------------------------------------------- venv
+mkdir -p "$DATA_DIR"
+exec 9>"$LOCK_FILE"
+flock 9
+
+requirements_hash="$(sha256sum "$PLUGIN_DIR/requirements.lock" | awk '{print $1}')"
+installed_hash=""
+[[ -f "$REQ_HASH_FILE" ]] && installed_hash="$(cat "$REQ_HASH_FILE" 2>/dev/null || true)"
+
+if [[ ! -x "$VENV_DIR/bin/python" || "$installed_hash" != "$requirements_hash" ]]; then
+  tmp_venv="${VENV_DIR}.tmp.$$"
+  rm -rf "$tmp_venv"
+  trap 'rm -rf "$tmp_venv"' EXIT
+  "$PYTHON_BIN" -m venv "$tmp_venv" \
+    || setup_error "Could not create the Python environment under $DATA_DIR."
+  "$tmp_venv/bin/python" -m pip install --disable-pip-version-check --require-hashes \
+      -r "$PLUGIN_DIR/requirements.lock" >&2 \
+    || setup_error "Could not install the hash-locked Python dependencies (network?)."
+  printf '%s\n' "$requirements_hash" > "$tmp_venv/.requirements.sha256"
+  rm -rf "$VENV_DIR"
+  mv "$tmp_venv" "$VENV_DIR"
+  trap - EXIT
+fi
+flock -u 9
+
+# ------------------------------------------------------------- this machine
+# Discover only on interfaces that carry a default route: that is where the
+# speakers are, and it keeps docker/libvirt/incus/VPN bridges out of the sink
+# list. Interface names differ per machine (wlo1, wlan0, enp3s0...), so never
+# hard-code them. If nothing has a default route yet, let pa-dlna watch every
+# interface and pick the network up when it appears.
+nics=""
+if command -v ip >/dev/null 2>&1; then
+  nics="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, -)"
+fi
+
+http_port=""
+for ((port = HTTP_PORT_FIRST; port <= HTTP_PORT_LAST; port++)); do
+  if ! "$PYTHON_BIN" - "$port" <<'PY' 2>/dev/null; then continue; fi
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    s.close()
+PY
+  http_port="$port"; break
+done
+[[ -n "$http_port" ]] || setup_error "No free TCP port between $HTTP_PORT_FIRST and $HTTP_PORT_LAST for the audio stream."
+
+args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l info -u)
+[[ -n "$nics" ]] && args+=(--nics "$nics")
+
+exec "$VENV_DIR/bin/python" -u "$PLUGIN_DIR/sonomarchy.py" "${args[@]}"

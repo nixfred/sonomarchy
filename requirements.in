@@ -1,0 +1,6 @@
+# Direct runtime dependencies of the Sonomarchy backend.
+# Regenerate the hash-locked file with:
+#   uv pip compile requirements.in --generate-hashes -o requirements.lock
+pa-dlna==1.2
+libpulse==0.7
+psutil>=7,<8
