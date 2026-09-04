@@ -118,6 +118,12 @@ Item {
         restartReason = plainText(message.reason, 64)
         state = "restarting"
         break
+      case "cleanup":
+        // Runs before pa-dlna configures its logging, so this is the only
+        // place the event is visible.
+        console.warn("Sonomarchy: unloaded " + parseInt(message.unloaded, 10)
+          + " stale sink(s) left behind by a previous backend")
+        break
     }
   }
 
