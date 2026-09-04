@@ -55,6 +55,7 @@ Item {
   function status() {
     var text = "Sonomarchy: " + state + ", " + zoneCount + " zone" + (zoneCount === 1 ? "" : "s")
     if (zoneCount > 0) text += " (" + zoneNames().join(", ") + ")"
+    else if (state === "ready") text += " (no Sonos found on this network yet; discovery keeps running)"
     if (lastError !== "") text += ", error=" + lastError
     return text
   }
@@ -160,6 +161,7 @@ Item {
       root.healthyThisRun = false
       root.setupError = ""
       root.zones = ({})
+      settleTimer.restart()
     }
 
     onExited: function(exitCode) {
@@ -196,6 +198,17 @@ Item {
     id: restartTimer
     repeat: false
     onTriggered: if (!root.expectedStop && !backend.running) backend.running = true
+  }
+
+  // "ready" is normally set by the first zone. On a network with no Sonos
+  // that never happens, and "starting" forever reads like a failure. If the
+  // backend has been up this long without a setup error, it is simply
+  // waiting for speakers to answer discovery.
+  Timer {
+    id: settleTimer
+    interval: 15000
+    repeat: false
+    onTriggered: if (root.state === "starting" && backend.running && root.setupError === "") root.state = "ready"
   }
 
   IpcHandler {
