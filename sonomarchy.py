@@ -116,7 +116,7 @@ import time
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -159,17 +159,37 @@ def _range_start(headers):
 
     A speaker that lost the stream mid-way retries with a Range header asking
     to resume where it was (observed: `RANGE: bytes=208901-` on a Playbar).
-    First fetches never carry one.
+    First fetches never carry one. Only that exact open-ended form is
+    honoured: a bounded `N-M`, a suffix `-N` or a multi-range would be
+    answered with an open-ended 206 we do not actually satisfy, so they are
+    treated as a plain request instead.
     """
     try:
         value = headers.get('Range') or headers.get('RANGE') or ''
         value = value.strip().lower()
         if not value.startswith('bytes='):
             return None
-        first = value[6:].split(',')[0].split('-')[0].strip()
+        spec = value[6:].strip()
+        if ',' in spec or not spec.endswith('-'):
+            return None
+        first = spec[:-1].strip()
         return int(first) if first.isdigit() else None
     except Exception:
         return None
+
+
+def _prepare_request_state(renderer, headers):
+    """Record what this GET asks for, before the track starts.
+
+    A request without a Range is a fresh representation: the speaker's byte
+    counter restarts at 0, so ours must too, or a later Range would be served
+    bytes from the previous stream.
+    """
+    start = _range_start(headers or {})
+    renderer._sonomarchy_range_start = start
+    if start is None:
+        _ring(renderer).reset()
+    return start
 
 
 def _http_ok_lines(mime_type, range_start=None):
@@ -374,6 +394,11 @@ _orig_handle_action = _pa_dlna.Renderer.handle_action
 
 
 async def _handle_action(self, action):
+    if isinstance(action, _pa_dlna.MetaData):
+        # A start is in flight from this moment, not from when Play returns:
+        # the direct-control check, the wait for STOPPED and SetAVTransportURI
+        # all come first, and the sweep must not double-start meanwhile.
+        _mark_started(self)
     # Only Sonos has direct-control sessions; skip the two extra SOAP round
     # trips per pulse event on every other brand of renderer.
     if isinstance(action, _pa_dlna.MetaData) and _is_sonos(self):
@@ -629,6 +654,11 @@ async def _close(self, *args, **kwargs):
     try:
         if self.nullsink is not None:
             emit('zone_gone', uuid=_sonos_uuid(self) or self.upnp_device.UDN)
+            # Per-zone recovery state must not outlive the renderer: a
+            # rediscovered zone would inherit a takeover throttle or an idle
+            # count it never earned.
+            _idle_sweeps.pop(self.nullsink.sink.name, None)
+        _last_takeover.pop(self.name, None)
     except Exception:
         pass
     return await _orig_close(self, *args, **kwargs)
@@ -805,11 +835,17 @@ async def _wait_until_stopped(renderer, timeout=5.0, step=0.5):
 
 
 def _processes_alive(processes):
-    """True if the parec -> encoder chain of a session is still running."""
+    """True if the parec -> encoder chain of a session is still running.
+
+    L16 has no encoder process (raw PCM straight from parec); judge it on
+    parec alone or every L16 zone would be called dead and restarted.
+    """
     if processes is None:
         return False
-    for proc in (getattr(processes, 'parec_proc', None),
-                 getattr(processes, 'encoder_proc', None)):
+    procs = [getattr(processes, 'parec_proc', None)]
+    if not getattr(processes, 'no_encoder', False):
+        procs.append(getattr(processes, 'encoder_proc', None))
+    for proc in procs:
         if proc is None or proc.returncode is not None:
             return False
     return True
@@ -856,6 +892,23 @@ async def _client_connected(self, reader, writer):
                 handler.send_error(H.HTTPStatus.HTTP_VERSION_NOT_SUPPORTED)
                 await renderer.disable_root_device()
                 break
+            if renderer.nullsink is None:
+                handler.send_error(H.HTTPStatus.CONFLICT,
+                                   f'{renderer.name} temporarily disabled')
+                break
+
+            # HEAD is answered from static knowledge and must never touch the
+            # stream: a HEAD during playback used to fall into the takeover
+            # branch below and silence the zone.
+            if handler.command == 'HEAD':
+                lines = _http_ok_lines(renderer.mime_type)
+                writer.write('\r\n'.join(lines).encode('latin-1'))
+                await writer.drain()
+                return
+            if handler.command != 'GET':
+                handler.send_error(H.HTTPStatus.METHOD_NOT_ALLOWED)
+                break
+
             if renderer.stream_sessions.is_playing:
                 if _should_takeover(renderer.name, time.monotonic()):
                     logger.warning(f'{renderer.name}: new stream request '
@@ -867,19 +920,10 @@ async def _client_connected(self, reader, writer):
                                        f'Cannot start {renderer.name} stream'
                                        f' (already running)')
                     break
-            if renderer.nullsink is None:
-                handler.send_error(H.HTTPStatus.CONFLICT,
-                                   f'{renderer.name} temporarily disabled')
-                break
 
-            # Resume request? Remember the start byte for the 206 answer.
-            renderer._sonomarchy_range_start = _range_start(
-                getattr(handler, 'headers', None) or {})
-
-            if handler.command == 'HEAD':
-                await H.write_http_ok(writer, renderer)
-                return
-
+            # Resume (Range) or fresh representation (ring reset).
+            _prepare_request_state(renderer,
+                                   getattr(handler, 'headers', None))
             await renderer.start_track(writer)
             do_close = False
             return
@@ -937,6 +981,37 @@ async def _track_run(self, reader):
 _wrap = getattr(_http_server, 'log_unhandled_exception', None)
 _http_server.Track.run = (_wrap(_http_server.logger)(_track_run)
                           if callable(_wrap) else _track_run)
+
+
+# --- e) no chunked terminator in a fixed-length body
+async def _track_shutdown(self):
+    """Mirror of pa-dlna 1.2 Track.shutdown with one line removed.
+
+    Upstream ends every track by writing `0\\r\\n\\r\\n` -- the chunked-transfer
+    terminator. Our responses carry a Content-Length instead (FIX 1), so those
+    five bytes are audio payload to the speaker: a few corrupt bytes in the
+    MP3, and, worse, five bytes the replay ring never saw, so a speaker that
+    consumed them asks to resume five bytes past our window and is refused.
+    """
+    if self.writer is None:
+        return
+    writer = self.writer
+    self.writer = None
+    try:
+        try:
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+        _http_server.logger.debug(f'{self.task_name}: track is stopped')
+    except asyncio.CancelledError:
+        _http_server.logger.debug(f'{self.task_name}: Got CancelledError at '
+                                  f'Track shutdown')
+
+
+_http_server.Track.shutdown = (_wrap(_http_server.logger)(_track_shutdown)
+                               if callable(_wrap) else _track_shutdown)
 
 
 # --- c) resume sweep
@@ -1021,14 +1096,19 @@ async def _maybe_resume(renderer, inputs_by_sink):
         # Nobody is playing into it. A session still running here is stale
         # (its player went away without pa-dlna noticing) -- give it two
         # sweeps in case it is just a gap between tracks, then tear it down.
-        if session_alive:
+        # "alive" here means anything still running: stop_track() keeps parec
+        # by upstream design, so a residual parec with is_playing False is
+        # exactly the leak this branch must catch.
+        residual = session_alive or _processes_alive(sessions.processes)
+        if residual:
             _idle_sweeps[sink_name] = _idle_sweeps.get(sink_name, 0) + 1
             if _idle_sweeps[sink_name] >= STALE_SWEEPS:
                 logger.warning(f'{renderer.name}: stream still running with '
                                f'nothing playing into the zone for '
                                f'{STALE_SWEEPS} sweeps; stopping it')
                 _idle_sweeps.pop(sink_name, None)
-                await sessions.stop_track()
+                # close_session, not stop_track: the whole chain goes.
+                await sessions.close_session()
                 try:
                     await renderer.stop()
                 except Exception:

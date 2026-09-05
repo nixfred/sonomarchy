@@ -9,23 +9,32 @@
 #
 # Everything writable lives under XDG dirs, never inside the plugin folder:
 # Omarchy rebuilds plugin services when a plugin writes into its own directory.
+#
+# Environment knobs (all optional):
+#   SONOMARCHY_HTTP_PORT   use exactly this TCP port for the stream (default:
+#                          first free port in 8080-8089)
+#   SONOMARCHY_SSDP_PORT   UDP port for SSDP replies (default 8081)
+#   SONOMARCHY_PYTHON      python interpreter to build the venv with
+#   SONOMARCHY_DRY_RUN=1   resolve everything, print the backend arguments,
+#                          exit without starting it (for tests and support)
 set -euo pipefail
 
 PLUGIN_ID="io.github.nixfred.sonomarchy"
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/${PLUGIN_ID}"
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/${PLUGIN_ID}"
 VENV_DIR="${DATA_DIR}/venv"
-LOCK_FILE="${DATA_DIR}/setup.lock"
+SETUP_LOCK="${DATA_DIR}/setup.lock"        # short: guards the venv build
+INSTANCE_LOCK="${DATA_DIR}/instance.lock"  # long: held for the backend's life
 REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 PYTHON_BIN="${SONOMARCHY_PYTHON:-python3}"
 
 # The UDP port SSDP replies come back on must be fixed so it can be allowed
 # through a firewall. The TCP port the speakers pull audio from is the first
-# free one in a small range; TCP and UDP namespaces are separate so 8081 can be
-# both. Override with SONOMARCHY_HTTP_PORT / SONOMARCHY_SSDP_PORT.
+# free one in a small range unless the user names one; TCP and UDP namespaces
+# are separate so 8081 can be both.
 SSDP_PORT="${SONOMARCHY_SSDP_PORT:-8081}"
-HTTP_PORT_FIRST="${SONOMARCHY_HTTP_PORT:-8080}"
-HTTP_PORT_LAST=8089
+HTTP_PORT_RANGE=(8080 8081 8082 8083 8084 8085 8086 8087 8088 8089)
 
 setup_error() {
   printf 'SONOMARCHY_SETUP_ERROR: %s\n' "$*" >&2
@@ -39,22 +48,52 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 \
   || setup_error "Python 3.9 or newer is required."
 "$PYTHON_BIN" -c 'import venv' 2>/dev/null \
   || setup_error "The python venv module is missing (package: python)."
-command -v parec >/dev/null 2>&1 \
-  || setup_error "parec is missing (package: libpulse)."
+for tool in parec pactl flock sha256sum; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || setup_error "$tool is missing (package: $([[ $tool == flock ]] && echo util-linux || [[ $tool == sha256sum ]] && echo coreutils || echo libpulse))."
+done
 command -v lame >/dev/null 2>&1 || command -v ffmpeg >/dev/null 2>&1 \
   || setup_error "An MP3 encoder is missing: install lame (or ffmpeg)."
 
-# pa-dlna refuses to start twice. A pa-dlna the user runs by hand (or left
-# behind as a user service from a manual install) would make every backend
-# start die instantly with a confusing message, so detect it the way pa-dlna
-# does -- a live PulseAudio client named pa-dlna -- and name the fix.
-if pactl list clients 2>/dev/null | grep -q 'application.name = "pa-dlna"'; then
-  setup_error "Another pa-dlna is already running (manual install or user service). Stop and disable it; Sonomarchy replaces it."
+mkdir -p "$DATA_DIR"
+
+# ------------------------------------------------------------ instance lock
+# Held on fd 8 for as long as the backend lives: the fd survives `exec` and
+# closes when the Python process exits. A reloaded service launches a new
+# backend while the previous one is still shutting down; waiting here avoids a
+# setup error the shell deliberately never retries. It also serialises the
+# stale-sink cleanup two starts could otherwise race through.
+# A dry run resolves ports and interfaces next to a running backend, so it
+# must not compete for the instance lock or object to the running instance.
+if [[ -z "${SONOMARCHY_DRY_RUN:-}" ]]; then
+  exec 8>"$INSTANCE_LOCK"
+  flock -w 20 8 \
+    || setup_error "Another Sonomarchy backend is still running after 20 s."
+
+  # pa-dlna refuses to start twice. A pa-dlna the user runs by hand (or left
+  # behind as a user service from a manual install) would make every backend
+  # start die instantly with a confusing message, so detect it the way
+  # pa-dlna does -- a live PulseAudio client named pa-dlna -- and name the
+  # fix. Captured into a variable on purpose: a `| grep -q` pipeline under
+  # pipefail can read as false when grep exits before pactl finishes writing.
+  pa_dlna_client_present() {
+    local clients
+    clients="$(pactl list clients 2>/dev/null || true)"
+    [[ "$clients" == *'application.name = "pa-dlna"'* ]]
+  }
+  if pa_dlna_client_present; then
+    # A backend that just exited drops its client a moment later.
+    for _ in 1 2 3 4 5; do
+      sleep 1
+      pa_dlna_client_present || break
+    done
+    pa_dlna_client_present \
+      && setup_error "Another pa-dlna is already running (manual install or user service). Stop and disable it; Sonomarchy replaces it."
+  fi
 fi
 
 # --------------------------------------------------------------------- venv
-mkdir -p "$DATA_DIR"
-exec 9>"$LOCK_FILE"
+exec 9>"$SETUP_LOCK"
 flock 9
 
 requirements_hash="$(sha256sum "$PLUGIN_DIR/requirements.lock" | awk '{print $1}')"
@@ -76,6 +115,7 @@ if [[ ! -x "$VENV_DIR/bin/python" || "$installed_hash" != "$requirements_hash" ]
   trap - EXIT
 fi
 flock -u 9
+exec 9>&-
 
 # ------------------------------------------------------------- this machine
 # Discover only on interfaces that carry a default route: that is where the
@@ -88,9 +128,8 @@ if command -v ip >/dev/null 2>&1; then
   nics="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, -)"
 fi
 
-http_port=""
-for ((port = HTTP_PORT_FIRST; port <= HTTP_PORT_LAST; port++)); do
-  if ! "$PYTHON_BIN" - "$port" <<'PY' 2>/dev/null; then continue; fi
+port_is_free() {
+  "$PYTHON_BIN" - "$1" <<'PY' 2>/dev/null
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
@@ -100,16 +139,26 @@ except OSError:
 finally:
     s.close()
 PY
-  http_port="$port"; break
+}
+
+if [[ -n "${SONOMARCHY_HTTP_PORT:-}" ]]; then
+  [[ "$SONOMARCHY_HTTP_PORT" =~ ^[0-9]+$ ]] && (( SONOMARCHY_HTTP_PORT > 0 && SONOMARCHY_HTTP_PORT < 65536 )) \
+    || setup_error "SONOMARCHY_HTTP_PORT must be a port number, got '$SONOMARCHY_HTTP_PORT'."
+  candidates=("$SONOMARCHY_HTTP_PORT")
+else
+  candidates=("${HTTP_PORT_RANGE[@]}")
+fi
+http_port=""
+for port in "${candidates[@]}"; do
+  if port_is_free "$port"; then http_port="$port"; break; fi
 done
-[[ -n "$http_port" ]] || setup_error "No free TCP port between $HTTP_PORT_FIRST and $HTTP_PORT_LAST for the audio stream."
+[[ -n "$http_port" ]] || setup_error "No free TCP port among ${candidates[*]} for the audio stream."
 
 # Support switch: `touch ~/.local/state/io.github.nixfred.sonomarchy/debug`
 # and restart the plugin to get a full DEBUG log of the backend at
 # .../backend.log (the shell journal only carries warnings and errors).
 # Remove the file and restart to turn it off. Never on by default: the file
 # grows for as long as the backend runs.
-STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/${PLUGIN_ID}"
 if [[ -f "$STATE_DIR/debug" ]]; then
   mkdir -p "$STATE_DIR"
   args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l debug -u -f "$STATE_DIR/backend.log")
@@ -118,5 +167,10 @@ else
   args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l info -u)
 fi
 [[ -n "$nics" ]] && args+=(--nics "$nics")
+
+if [[ -n "${SONOMARCHY_DRY_RUN:-}" ]]; then
+  printf '%s\n' "${args[@]}"
+  exit 0
+fi
 
 exec "$VENV_DIR/bin/python" -u "$PLUGIN_DIR/sonomarchy.py" "${args[@]}"

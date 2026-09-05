@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.2 — 2026-09-04
+
+Fixes from an independent adversarial review (Codex), each confirmed in the
+code before changing it.
+
+- Fixed: every track ended with pa-dlna's chunked-transfer terminator
+  (`0\r\n\r\n`) written into what is a fixed-length body — five garbage
+  bytes in the MP3 that the replay ring never saw, so a speaker that had
+  consumed them asked to resume five bytes past our window and was refused.
+- Fixed: a `HEAD` request during playback silenced the zone (it fell into
+  the takeover path). `HEAD` is answered statically; other methods get 405.
+- Fixed: tearing down a stale stream used `stop_track`, which by design
+  keeps the capture process; a leftover `parec` could linger. The whole
+  chain is closed now, and a residual capture process is itself detected.
+- Fixed: the sweep's start grace began only after `Play` returned; the
+  normal start does several SOAP round-trips first. Marked at entry.
+- Fixed: a reconnect without `Range` inherited the previous stream's
+  offsets; a later `Range` could be served the wrong bytes. Reset on any
+  plain request. Only the exact `bytes=N-` form is treated as a resume.
+- Fixed: the launcher had no instance lock across `exec`; a plugin reload
+  could race the previous backend and land in a setup error the shell never
+  retries. A lock is now held for the backend's life with a 20 s wait; the
+  running-instance check no longer relies on a `pipefail`-sensitive pipe;
+  `pactl`, `flock` and `sha256sum` are checked like the other dependencies;
+  `SONOMARCHY_HTTP_PORT` is honoured exactly; `SONOMARCHY_DRY_RUN=1`
+  prints the resolved arguments for tests and support.
+- Fixed: the status kept `error=…` from a previous run after a healthy
+  restart; a healthy settle or a zone arriving now clears it and the backoff.
+- Fixed: raw-PCM (L16) renderers, which have no encoder process, were judged
+  permanently dead by the sweep.
+- Fixed: per-zone takeover/idle state is purged when a zone closes.
+
 ## 0.1.1 — 2026-09-04
 
 - Fixed: a zone could go silent for good while the application kept playing

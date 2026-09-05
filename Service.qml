@@ -99,6 +99,7 @@ Item {
         state = "ready"
         healthyThisRun = true
         restartAttempt = 0
+        lastError = ""          // a zone arriving proves the previous failure is over
         break
       }
       case "zone_gone": {
@@ -217,7 +218,17 @@ Item {
     id: settleTimer
     interval: 15000
     repeat: false
-    onTriggered: if (root.state === "starting" && backend.running && root.setupError === "") root.state = "ready"
+    onTriggered: {
+      // A backend that has run for RESUME-grace seconds without a setup error
+      // is healthy even on a network with no Sonos: clear the previous run's
+      // failure so status and the restart backoff do not carry it forever.
+      if (root.state === "starting" && backend.running && root.setupError === "") {
+        root.state = "ready"
+        root.healthyThisRun = true
+        root.restartAttempt = 0
+        root.lastError = ""
+      }
+    }
   }
 
   IpcHandler {

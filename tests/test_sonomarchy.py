@@ -362,15 +362,45 @@ class ReplayRing(unittest.TestCase):
 class RangeResume(unittest.TestCase):
     """A speaker retrying a broken stream asks to resume with a Range header."""
 
-    def test_range_start_parsing(self):
+    def test_range_start_parsing_accepts_only_the_open_ended_form(self):
         m = load()
         self.assertEqual(m._range_start({'RANGE': 'bytes=208901-'}), 208901)
         self.assertEqual(m._range_start({'Range': 'bytes=0-'}), 0)
-        self.assertEqual(m._range_start({'Range': 'bytes=5-9,20-'}), 5)
+        self.assertEqual(m._range_start({'Range': ' Bytes=12- '}), 12)
+        for bad in ('bytes=5-9', 'bytes=5-9,20-', 'bytes=-500', 'items=1-2', 'bytes=', 'bytes=a-'):
+            self.assertIsNone(m._range_start({'Range': bad}), bad)
         self.assertIsNone(m._range_start({}))
-        self.assertIsNone(m._range_start({'Range': 'items=1-2'}))
-        self.assertIsNone(m._range_start({'Range': 'bytes=-500'}))   # suffix range: not a resume
         self.assertIsNone(m._range_start(None))
+
+    def test_plain_get_resets_the_ring_and_range_keeps_it(self):
+        m = load()
+        r = type('R', (), {})()
+        ring = m._ring(r); ring.append(b'x' * 100)
+        self.assertEqual(m._prepare_request_state(r, {'Range': 'bytes=40-'}), 40)
+        self.assertEqual(ring.end, 100)                      # resume: keep history
+        self.assertIsNone(m._prepare_request_state(r, {}))
+        self.assertEqual(ring.end, 0)                        # fresh representation: byte 0
+        self.assertIsNone(m._prepare_request_state(r, None))
+
+    def test_shutdown_writes_no_chunked_terminator(self):
+        m = load()
+        writes = []
+
+        class Writer:
+            closed = False
+            def is_closing(s): return False
+            def write(s, b): writes.append(bytes(b))
+            async def drain(s): pass
+            def close(s): s.closed = True
+            async def wait_closed(s): pass
+
+        class Track:
+            task_name = 't'
+        t = Track(); w = t.writer = Writer()
+        asyncio.run(m._track_shutdown(t))
+        self.assertEqual(writes, [])                         # upstream wrote b'0\r\n\r\n' here
+        self.assertTrue(w.closed); self.assertIsNone(t.writer)
+        asyncio.run(m._track_shutdown(t))                    # idempotent
 
     def test_206_headers_only_for_a_real_resume(self):
         m = load()
@@ -491,6 +521,42 @@ class StreamResume(unittest.TestCase):
         dead = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(0)})()
         self.assertFalse(m._processes_alive(dead))
         self.assertFalse(m._processes_alive(None))
+        # L16 has no encoder process at all: parec alone decides
+        l16 = type('S', (), {'parec_proc': P(None), 'encoder_proc': None, 'no_encoder': True})()
+        self.assertTrue(m._processes_alive(l16))
+        l16_dead = type('S', (), {'parec_proc': P(1), 'encoder_proc': None, 'no_encoder': True})()
+        self.assertFalse(m._processes_alive(l16_dead))
+
+    def test_start_is_marked_at_handle_action_entry(self):
+        m = load()
+        calls = []
+
+        async def fake_orig(self, action): calls.append('orig')
+        m._orig_handle_action = fake_orig
+
+        class R:
+            name = 'Office'
+            upnp_device = type('D', (), {'UDN': 'uuid:RINCON_ABC_MR'})()
+            async def get_transport_state(s): return 'STOPPED'
+        r = R()
+        asyncio.run(m._handle_action(r, m._pa_dlna.MetaData('cliamp', '', 'x')))
+        self.assertTrue(m._in_start_grace(r))
+        self.assertEqual(calls, ['orig'])
+        r2 = R()
+        asyncio.run(m._handle_action(r2, 'Stop'))            # not a start
+        self.assertFalse(m._in_start_grace(r2))
+
+    def test_close_purges_per_zone_recovery_state(self):
+        m = load()
+
+        async def fake_close(self, *a, **k): return 'closed'
+        m._orig_close = fake_close
+        m.emit = lambda *a, **k: None
+        r = type('R', (), {'name': 'Office', 'upnp_device': type('D', (), {'UDN': 'uuid:RINCON_ABC_MR'})(),
+                           'nullsink': type('N', (), {'sink': type('K', (), {'name': 'sink-office'})()})()})()
+        m._last_takeover['Office'] = 1.0; m._idle_sweeps['sink-office'] = 1
+        self.assertEqual(asyncio.run(m._close(r)), 'closed')
+        self.assertNotIn('Office', m._last_takeover); self.assertNotIn('sink-office', m._idle_sweeps)
 
     def test_resume_loop_handle_is_retained(self):
         # asyncio only weakly references tasks; a dropped handle means the
@@ -523,6 +589,7 @@ class StreamResume(unittest.TestCase):
                 P = lambda rc: type('P', (), {'returncode': rc})()
                 s.processes = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(None if alive else 0)})()
             async def stop_track(s): actions.append('stop_track')
+            async def close_session(s, shutdown_coro=False): actions.append('close_session')
 
         class SinkInput:
             def __init__(s, index, sink): s.index = index; s.sink = sink; s.proplist = {'application.name': 'cliamp'}
@@ -581,7 +648,12 @@ class StreamResume(unittest.TestCase):
         asyncio.run(m._maybe_resume(r, {}))          # sweep 1: could be a track gap
         self.assertEqual(actions, [])
         asyncio.run(m._maybe_resume(r, {}))          # sweep 2: stale for real
-        self.assertEqual(actions, ['stop_track', 'stop'])
+        self.assertEqual(actions, ['close_session', 'stop'])   # whole chain, parec included
+        # a residual parec after stop_track (is_playing False, processes alive)
+        # is exactly the leak this must catch
+        actions.clear(); rr = self.make_renderer(m, actions, False, True, 'STOPPED')
+        asyncio.run(m._maybe_resume(rr, {})); asyncio.run(m._maybe_resume(rr, {}))
+        self.assertEqual(actions, ['close_session', 'stop'])
         # a player coming back resets the count
         actions.clear(); r2 = self.make_renderer(m, actions, True, True, 'PLAYING')
         asyncio.run(m._maybe_resume(r2, {}))
