@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: a zone could go silent for good while the application kept playing
+  into it. The speaker retries the stream after an early EOF, pa-dlna
+  answered 409 because its session flag was still set from the dead track,
+  and nothing ever restarted the stream. Now the session is cleared on an
+  unexpected EOF, a new connection takes over a stale one instead of being
+  refused, and a periodic sweep restarts any zone that has a player but no
+  stream.
+- Fixed: after ending a Spotify Connect session the backend waits for the
+  player to report STOPPED instead of sleeping a fixed second, which on a
+  Play:1 collided with the player's own transition and produced the same 409.
+
 ## 0.1.0 — 2026-09-04
 
 First release.

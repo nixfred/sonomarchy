@@ -274,6 +274,92 @@ class StaleSinkCleanup(unittest.TestCase):
         self.assertEqual(unloaded, ['536870916', '536870918'])
 
 
+class StreamResume(unittest.TestCase):
+    """FIX 10: a dead stream must be able to come back."""
+
+    def test_takeover_is_rate_limited_per_renderer(self):
+        m = load()
+        self.assertTrue(m._should_takeover('Office', 100.0))
+        self.assertFalse(m._should_takeover('Office', 101.0))     # too soon
+        self.assertTrue(m._should_takeover('Kitchen', 101.0))     # other zone
+        self.assertTrue(m._should_takeover('Office', 100.0 + m.TAKEOVER_MIN_INTERVAL))
+
+    def test_unlatch_only_when_track_is_current_and_playing(self):
+        m = load()
+        calls = []
+
+        class Session:
+            def __init__(s, track, playing):
+                s.track = track; s.is_playing = playing
+            async def stop_track(s): calls.append('stop')
+
+        class Track:
+            task_name = 't'
+            def __init__(s, session): s.session = session
+        t = Track(None); t.session = Session(t, True)
+        asyncio.run(m._unlatch_after_eof(t))
+        self.assertEqual(calls, ['stop'])
+        calls.clear()
+        t2 = Track(None); t2.session = Session(object(), True)   # a newer track owns the session
+        asyncio.run(m._unlatch_after_eof(t2))
+        t3 = Track(None); t3.session = Session(t3, False)        # already stopped deliberately
+        asyncio.run(m._unlatch_after_eof(t3))
+        self.assertEqual(calls, [])
+
+    def test_wait_until_stopped_polls_and_times_out(self):
+        m = load()
+
+        class R:
+            def __init__(s, states): s.states = list(states)
+            async def get_transport_state(s):
+                return s.states.pop(0) if len(s.states) > 1 else s.states[0]
+        self.assertTrue(asyncio.run(m._wait_until_stopped(R(['TRANSITIONING', 'PAUSED_PLAYBACK', 'STOPPED']), timeout=2, step=0.01)))
+        self.assertFalse(asyncio.run(m._wait_until_stopped(R(['PLAYING']), timeout=0.05, step=0.01)))
+
+    def test_processes_alive(self):
+        m = load()
+        P = lambda rc: type('P', (), {'returncode': rc})()
+        procs = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(None)})()
+        self.assertTrue(m._processes_alive(procs))
+        dead = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(0)})()
+        self.assertFalse(m._processes_alive(dead))
+        self.assertFalse(m._processes_alive(None))
+
+    def test_resume_restarts_only_a_silent_zone_with_a_player(self):
+        m = load()
+        actions = []
+
+        class Sessions:
+            def __init__(s, playing, alive):
+                s.is_playing = playing
+                P = lambda rc: type('P', (), {'returncode': rc})()
+                s.processes = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(None if alive else 0)})()
+            async def stop_track(s): actions.append('stop_track')
+
+        class Renderer:
+            closing = False
+            description = 'Office (Sonos Playbar)'
+            name = 'Office'
+            def __init__(s, playing, alive, state='STOPPED'):
+                s.stream_sessions = Sessions(playing, alive); s.state = state
+                s.nullsink = type('N', (), {'sink': type('K', (), {'name': 'sink-office'})(), 'sink_input': None})()
+            async def get_transport_state(s): return s.state
+            async def stop(s): actions.append('stop')
+            async def handle_action(s, meta): actions.append(('start', meta.publisher))
+            def sink_input_meta(s, si): return None
+        m.emit = lambda *a, **k: None
+
+        # healthy zone with a player: untouched
+        asyncio.run(m._maybe_resume(Renderer(True, True), {'sink-office': ['cliamp']}))
+        self.assertEqual(actions, [])
+        # silent zone, nobody playing: untouched
+        asyncio.run(m._maybe_resume(Renderer(True, False), {}))
+        self.assertEqual(actions, [])
+        # latched dead session, player still going, transport STOPPED: restarted
+        asyncio.run(m._maybe_resume(Renderer(True, False), {'sink-office': ['cliamp']}))
+        self.assertEqual(actions, ['stop_track', ('start', 'cliamp')])
+
+
 class ArgvParsing(unittest.TestCase):
     def test_nics_forms(self):
         m = load()

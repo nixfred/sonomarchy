@@ -185,6 +185,10 @@ async def _write_track(self, reader):
             await self.writer.drain()
         if not data or partial_data:
             logger.debug(f'EOF reading from pipe on {self.task_name}')
+            # FIX 10a: an EOF that was not preceded by a deliberate stop means
+            # the encoder died; clear the session so the speaker's retry is
+            # served instead of answered 409.
+            await _unlatch_after_eof(self)
             break
 
 
@@ -253,9 +257,13 @@ async def _handle_action(self, action):
                     await self.soap_action(_pa_dlna.AVTRANSPORT,
                                            'EndDirectControlSession',
                                            {'InstanceID': 0})
-                    # Give the player a moment to settle into STOPPED before
-                    # upstream re-reads the transport state.
-                    await asyncio.sleep(1)
+                    # Wait for the player to actually reach STOPPED. A fixed
+                    # 1 s was not enough on a Play:1: its own post-session
+                    # transition fetched our URL while upstream's Play fetched
+                    # it again, and the collision ended in a 409 and a reset.
+                    if not await _wait_until_stopped(self):
+                        logger.warning(f'{self.name}: still not STOPPED after '
+                                       f'ending the direct-control session')
         except Exception as e:
             # Never let the workaround break normal playback.
             logger.debug(f'{self.name}: direct-control check skipped: {e!r}')
@@ -455,6 +463,7 @@ _orig_register = _pa_dlna.AVControlPoint.register
 
 
 async def _register(self, renderer):
+    _ensure_resume_loop(self)          # FIX 10c, needs the running loop
     uuid = _sonos_uuid(renderer)
     if uuid:
         try:
@@ -581,6 +590,244 @@ def _unload_stale_sinks():
     except Exception as e:
         logger.debug(f'stale sink cleanup skipped: {e!r}')
         return 0
+
+
+# ===========================================================================
+# FIX 10 - a stream that dies must be able to come back
+# ===========================================================================
+# Observed 2026-09-04, first in the wild after a Spotify Connect takeover and
+# then reproduced on demand by killing the encoder mid-stream: the speaker
+# sees the early EOF on a stream that promised 100 GB and does the right thing
+# -- it retries the GET. pa-dlna's StreamSessions.is_playing is still True
+# from the dead track (only stop_track/close_session clear it, and those run
+# only on a PulseAudio 'remove' event), so the retry is answered 409, the
+# speaker gives up, and because the application's sink-input never changed no
+# event ever restarts the stream. Result: a sink that is RUNNING and silent,
+# indefinitely, while the audio panel says everything is fine.
+#
+# Three layers, each proven separately:
+#   a) unlatch  - an unexpected EOF on the encoder pipe clears the session, so
+#                 the speaker's own retry is simply served (see _write_track);
+#   b) takeover - a GET that arrives while a track is nominally running stops
+#                 that track and serves the new connection instead of 409.
+#                 Rate-limited per renderer so two connections cannot
+#                 ping-pong;
+#   c) resume   - every few seconds, a zone into which an application is still
+#                 playing but that has no stream running is restarted.
+
+TAKEOVER_MIN_INTERVAL = 3.0     # seconds between takeovers, per renderer
+RESUME_INTERVAL = 8             # seconds between resume sweeps
+_last_takeover = {}
+_resume_started = False
+
+
+async def _unlatch_after_eof(track):
+    """Clear a session whose track ended without a deliberate stop."""
+    session = track.session
+    try:
+        if session.track is track and session.is_playing:
+            logger.warning(f'{track.task_name}: stream ended unexpectedly; '
+                           f'clearing the session so the speaker can '
+                           f'reconnect')
+            await session.stop_track()
+    except Exception as e:
+        logger.debug(f'unlatch skipped: {e!r}')
+
+
+def _should_takeover(name, now):
+    last = _last_takeover.get(name, 0.0)
+    if now - last < TAKEOVER_MIN_INTERVAL:
+        return False
+    _last_takeover[name] = now
+    return True
+
+
+async def _wait_until_stopped(renderer, timeout=5.0, step=0.5):
+    """Poll the transport until it reports STOPPED; True if it did in time."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(step)
+        try:
+            state = await renderer.get_transport_state()
+        except Exception:
+            continue
+        if state in ('STOPPED', 'NO_MEDIA_PRESENT'):
+            return True
+    return False
+
+
+def _processes_alive(processes):
+    """True if the parec -> encoder chain of a session is still running."""
+    if processes is None:
+        return False
+    for proc in (getattr(processes, 'parec_proc', None),
+                 getattr(processes, 'encoder_proc', None)):
+        if proc is None or proc.returncode is not None:
+            return False
+    return True
+
+
+# --- b) takeover: upstream HTTPServer.client_connected with one branch changed
+async def _client_connected(self, reader, writer):
+    """Handle an HTTP GET request from a DLNA device.
+
+    Mirrors pa-dlna 1.2 HTTPServer.client_connected (pinned in
+    requirements.lock). The only change is the `is_playing` branch: instead
+    of refusing a second connection with 409, hand the stream to it.
+    """
+    H = _http_server
+    peername = writer.get_extra_info('peername')
+    ip_source = peername[0]
+    if ip_source not in self.allowed_ips:
+        sockname = writer.get_extra_info('sockname')
+        H.logger.warning(f'Discarded TCP connection from {ip_source} (not'
+                         f' allowed) received on {sockname[0]}')
+        writer.close()
+        return
+
+    do_close = True
+    try:
+        handler = H.HTTPRequestHandler(reader, writer, peername)
+        await handler.set_rfile()
+        handler.handle_one_request()
+
+        if not hasattr(handler, 'path'):
+            content = handler.rfile.getvalue().decode()
+            request = content.splitlines()[0] if content else ''
+            H.logger.error(f'Invalid path in HTTP request from {ip_source}:'
+                           f' {request}')
+            return
+
+        uri_path = H.urllib.parse.unquote(handler.path)
+
+        for renderer in self.control_point.renderers():
+            if not renderer.match(uri_path):
+                continue
+
+            if handler.request_version != 'HTTP/1.1':
+                handler.send_error(H.HTTPStatus.HTTP_VERSION_NOT_SUPPORTED)
+                await renderer.disable_root_device()
+                break
+            if renderer.stream_sessions.is_playing:
+                if _should_takeover(renderer.name, time.monotonic()):
+                    logger.warning(f'{renderer.name}: new stream request '
+                                   f'while a track is running; handing the '
+                                   f'stream to the new connection')
+                    await renderer.stream_sessions.stop_track()
+                else:
+                    handler.send_error(H.HTTPStatus.CONFLICT,
+                                       f'Cannot start {renderer.name} stream'
+                                       f' (already running)')
+                    break
+            if renderer.nullsink is None:
+                handler.send_error(H.HTTPStatus.CONFLICT,
+                                   f'{renderer.name} temporarily disabled')
+                break
+
+            if handler.command == 'HEAD':
+                await H.write_http_ok(writer, renderer)
+                return
+
+            await renderer.start_track(writer)
+            do_close = False
+            return
+
+        else:
+            handler.send_error(H.HTTPStatus.NOT_FOUND,
+                               'Cannot find a matching renderer')
+
+        await writer.drain()
+
+    finally:
+        if do_close:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+
+
+_http_server.HTTPServer.client_connected = _client_connected
+
+
+# --- c) resume sweep
+def _pactl_inputs_by_sink():
+    """{sink_name: [application names]} for uncorked sink-inputs, via pactl."""
+    import subprocess
+
+    def pactl(*args):
+        return json.loads(subprocess.run(['pactl', '-f', 'json', 'list', *args],
+                                         capture_output=True, text=True,
+                                         timeout=5).stdout or '[]')
+
+    sinks = {s.get('index'): s.get('name') for s in pactl('sinks')}
+    result = {}
+    for si in pactl('sink-inputs'):
+        if si.get('corked'):
+            continue
+        name = sinks.get(si.get('sink'))
+        if name:
+            app = (si.get('properties') or {}).get('application.name') or 'audio'
+            result.setdefault(name, []).append(app)
+    return result
+
+
+async def _maybe_resume(renderer, inputs_by_sink):
+    if renderer.nullsink is None or getattr(renderer, 'closing', False):
+        return
+    sink_name = renderer.nullsink.sink.name
+    apps = inputs_by_sink.get(sink_name)
+    if not apps:
+        return                                   # nobody is playing into it
+    sessions = renderer.stream_sessions
+    if sessions.is_playing and _processes_alive(sessions.processes):
+        return                                   # healthy
+
+    state = await renderer.get_transport_state()
+    logger.warning(f'{renderer.name}: {apps[0]} is still playing into the '
+                   f'zone but no stream is running (transport {state}); '
+                   f'restarting the stream')
+    await sessions.stop_track()
+    if state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
+        try:
+            await renderer.stop()
+        except Exception:
+            pass
+        await _wait_until_stopped(renderer, timeout=3.0)
+    sink_input = renderer.nullsink.sink_input
+    meta = renderer.sink_input_meta(sink_input) if sink_input is not None \
+        else _pa_dlna.MetaData(apps[0], '', apps[0])
+    emit('resumed', zone=renderer.description, app=apps[0])
+    await renderer.handle_action(meta)
+
+
+async def _resume_loop(control_point):
+    while True:
+        await asyncio.sleep(RESUME_INTERVAL)
+        try:
+            loop = asyncio.get_running_loop()
+            inputs = await loop.run_in_executor(None, _pactl_inputs_by_sink)
+            for renderer in list(control_point.renderers()):
+                try:
+                    await _maybe_resume(renderer, inputs)
+                except Exception as e:
+                    logger.debug(f'resume check for {renderer.name} '
+                                 f'skipped: {e!r}')
+        except Exception as e:
+            logger.debug(f'resume sweep skipped: {e!r}')
+
+
+def _ensure_resume_loop(control_point):
+    """Start the sweep on pa-dlna's own event loop, once."""
+    global _resume_started
+    if _resume_started:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_resume_loop(control_point),
+                                               name='sonomarchy-resume')
+        _resume_started = True
+    except Exception as e:
+        logger.debug(f'resume loop not started: {e!r}')
 
 
 def main(argv=None):
