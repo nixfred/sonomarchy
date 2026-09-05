@@ -379,9 +379,11 @@ class StreamResume(unittest.TestCase):
         # silent zone, nobody playing: untouched
         asyncio.run(m._maybe_resume(Renderer(True, False), {}))
         self.assertEqual(actions, [])
-        # latched dead session, player still going, transport STOPPED: restarted
+        # latched dead session, player still going, transport STOPPED: restarted,
+        # and always with an explicit Stop first (a player that gave up on a
+        # broken stream will not re-fetch the same URL on a bare Play)
         asyncio.run(m._maybe_resume(Renderer(True, False), {'sink-office': ['cliamp']}))
-        self.assertEqual(actions, ['stop_track', ('start', 'cliamp')])
+        self.assertEqual(actions, ['stop_track', 'stop', ('start', 'cliamp')])
 
 
 class ArgvParsing(unittest.TestCase):
