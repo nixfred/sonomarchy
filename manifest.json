@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.nixfred.sonomarchy",
   "name": "Sonomarchy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "nixfred",
   "license": "MIT",
   "description": "Makes every Sonos zone on your network a selectable system audio output, including legacy Play:1 / Play:3 / Play:5 / Playbar / Connect speakers that have no AirPlay.",

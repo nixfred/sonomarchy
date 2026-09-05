@@ -116,7 +116,7 @@ import time
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -865,22 +865,76 @@ def _pactl_inputs_by_sink():
     return result
 
 
+_ACTIVE_STATES = ('PLAYING', 'TRANSITIONING')
+# A zone whose session is alive but whose sink has had no player for this many
+# consecutive sweeps is torn down. Two sweeps (16 s) outlasts the 10 s
+# track-change grace, so a player between songs is never cut off.
+STALE_SWEEPS = 2
+_idle_sweeps = {}
+
+
+async def _adopt_sink_input(renderer):
+    """Point pa-dlna at the sink-input that owns the stream we are restarting.
+
+    Upstream sets nullsink.sink_input from the pulse event that starts a
+    session. A sweep-started session has no such event, so without this the
+    later 'remove' event for that application is not recognised as ours and
+    the stream keeps running after the player stops -- observed as a live
+    parec/encoder pair on a STOPPED zone with nothing playing into it.
+    """
+    try:
+        sink_index = renderer.nullsink.sink.index
+        lib_pulse = renderer.control_point.pulse.lib_pulse
+        for sink_input in await lib_pulse.pa_context_get_sink_input_info_list():
+            if getattr(sink_input, 'sink', None) == sink_index:
+                renderer.nullsink.sink_input = sink_input
+                return sink_input
+    except Exception as e:
+        logger.debug(f'{renderer.name}: could not adopt a sink-input: {e!r}')
+    return None
+
+
 async def _maybe_resume(renderer, inputs_by_sink):
     if renderer.nullsink is None or getattr(renderer, 'closing', False):
         return
     sink_name = renderer.nullsink.sink.name
     apps = inputs_by_sink.get(sink_name)
-    if not apps:
-        return                                   # nobody is playing into it
     sessions = renderer.stream_sessions
-    if sessions.is_playing and _processes_alive(sessions.processes):
+    session_alive = sessions.is_playing and _processes_alive(sessions.processes)
+
+    if not apps:
+        # Nobody is playing into it. A session still running here is stale
+        # (its player went away without pa-dlna noticing) -- give it two
+        # sweeps in case it is just a gap between tracks, then tear it down.
+        if session_alive:
+            _idle_sweeps[sink_name] = _idle_sweeps.get(sink_name, 0) + 1
+            if _idle_sweeps[sink_name] >= STALE_SWEEPS:
+                logger.warning(f'{renderer.name}: stream still running with '
+                               f'nothing playing into the zone for '
+                               f'{STALE_SWEEPS} sweeps; stopping it')
+                _idle_sweeps.pop(sink_name, None)
+                await sessions.stop_track()
+                try:
+                    await renderer.stop()
+                except Exception:
+                    pass
+        else:
+            _idle_sweeps.pop(sink_name, None)
+        return
+    _idle_sweeps.pop(sink_name, None)
+
+    # The speaker is the truth about whether audio is actually playing: a
+    # session can look alive on our side while the zone reads STOPPED.
+    state = await renderer.get_transport_state()
+    if session_alive and state in _ACTIVE_STATES:
         return                                   # healthy
 
-    state = await renderer.get_transport_state()
-    logger.warning(f'{renderer.name}: {apps[0]} is still playing into the '
-                   f'zone but no stream is running (transport {state}); '
-                   f'restarting the stream')
+    logger.warning(f'{renderer.name}: {apps[0]} is playing into the zone but '
+                   f'the stream is not (session '
+                   f'{"alive" if session_alive else "dead"}, transport '
+                   f'{state}); restarting the stream')
     await sessions.stop_track()
+    await _adopt_sink_input(renderer)
     # Always send an explicit Stop, even when the transport already reads
     # STOPPED: after a broken stream the player will not re-fetch the same
     # URL on a bare Play, but it does after Stop -> SetAVTransportURI -> Play,

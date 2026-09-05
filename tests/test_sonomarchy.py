@@ -431,41 +431,72 @@ class StreamResume(unittest.TestCase):
         asyncio.run(go())
         self.assertGreater(len(seen), 0, 'sweep never ran')
 
-    def test_resume_restarts_only_a_silent_zone_with_a_player(self):
-        m = load()
-        actions = []
-
+    def make_renderer(self, m, actions, playing, alive, state='STOPPED', inputs=()):
         class Sessions:
-            def __init__(s, playing, alive):
+            def __init__(s):
                 s.is_playing = playing
                 P = lambda rc: type('P', (), {'returncode': rc})()
                 s.processes = type('S', (), {'parec_proc': P(None), 'encoder_proc': P(None if alive else 0)})()
             async def stop_track(s): actions.append('stop_track')
 
+        class SinkInput:
+            def __init__(s, index, sink): s.index = index; s.sink = sink; s.proplist = {'application.name': 'cliamp'}
+
+        class LibPulse:
+            async def pa_context_get_sink_input_info_list(s): return [SinkInput(i, k) for i, k in inputs]
+
         class Renderer:
             closing = False
             description = 'Office (Sonos Playbar)'
             name = 'Office'
-            def __init__(s, playing, alive, state='STOPPED'):
-                s.stream_sessions = Sessions(playing, alive); s.state = state
-                s.nullsink = type('N', (), {'sink': type('K', (), {'name': 'sink-office'})(), 'sink_input': None})()
+            control_point = type('CP', (), {'pulse': type('PU', (), {'lib_pulse': LibPulse()})()})()
+            def __init__(s):
+                s.stream_sessions = Sessions(); s.state = state
+                s.nullsink = type('N', (), {'sink': type('K', (), {'name': 'sink-office', 'index': 42})(), 'sink_input': None})()
             async def get_transport_state(s): return s.state
             async def stop(s): actions.append('stop')
             async def handle_action(s, meta): actions.append(('start', meta.publisher))
-            def sink_input_meta(s, si): return None
+            def sink_input_meta(s, si): return m._pa_dlna.MetaData(si.proplist['application.name'], '', 'x')
         m.emit = lambda *a, **k: None
+        return Renderer()
 
-        # healthy zone with a player: untouched
-        asyncio.run(m._maybe_resume(Renderer(True, True), {'sink-office': ['cliamp']}))
+    def test_resume_restarts_only_a_silent_zone_with_a_player(self):
+        m = load(); actions = []
+        # healthy zone with a player and the speaker PLAYING: untouched
+        asyncio.run(m._maybe_resume(self.make_renderer(m, actions, True, True, 'PLAYING'), {'sink-office': ['cliamp']}))
         self.assertEqual(actions, [])
-        # silent zone, nobody playing: untouched
-        asyncio.run(m._maybe_resume(Renderer(True, False), {}))
-        self.assertEqual(actions, [])
-        # latched dead session, player still going, transport STOPPED: restarted,
-        # and always with an explicit Stop first (a player that gave up on a
-        # broken stream will not re-fetch the same URL on a bare Play)
-        asyncio.run(m._maybe_resume(Renderer(True, False), {'sink-office': ['cliamp']}))
+        # dead session, player still going, transport STOPPED: restarted, with an
+        # explicit Stop first (a player that gave up will not re-fetch the same
+        # URL on a bare Play), and the owning sink-input adopted for metadata
+        r = self.make_renderer(m, actions, True, False, 'STOPPED', inputs=[(7, 99), (8, 42)])
+        asyncio.run(m._maybe_resume(r, {'sink-office': ['cliamp']}))
         self.assertEqual(actions, ['stop_track', 'stop', ('start', 'cliamp')])
+        self.assertEqual(r.nullsink.sink_input.index, 8)          # the one on our sink
+
+    def test_speaker_state_is_the_truth(self):
+        # session looks alive on our side but the zone reads STOPPED: restart
+        m = load(); actions = []
+        asyncio.run(m._maybe_resume(self.make_renderer(m, actions, True, True, 'STOPPED'), {'sink-office': ['cliamp']}))
+        self.assertEqual(actions[:2], ['stop_track', 'stop'])
+        self.assertEqual(actions[-1][0], 'start')
+
+    def test_stale_session_torn_down_after_two_idle_sweeps(self):
+        m = load(); actions = []
+        r = self.make_renderer(m, actions, True, True, 'STOPPED')
+        asyncio.run(m._maybe_resume(r, {}))          # sweep 1: could be a track gap
+        self.assertEqual(actions, [])
+        asyncio.run(m._maybe_resume(r, {}))          # sweep 2: stale for real
+        self.assertEqual(actions, ['stop_track', 'stop'])
+        # a player coming back resets the count
+        actions.clear(); r2 = self.make_renderer(m, actions, True, True, 'PLAYING')
+        asyncio.run(m._maybe_resume(r2, {}))
+        asyncio.run(m._maybe_resume(r2, {'sink-office': ['cliamp']}))
+        asyncio.run(m._maybe_resume(r2, {}))
+        self.assertEqual(actions, [])
+        # dead session and nobody playing: nothing to do, ever
+        actions.clear(); r3 = self.make_renderer(m, actions, False, False, 'STOPPED')
+        for _ in range(3): asyncio.run(m._maybe_resume(r3, {}))
+        self.assertEqual(actions, [])
 
 
 class ArgvParsing(unittest.TestCase):
