@@ -154,12 +154,52 @@ _pa_dlna.ISSUE_48_TIMER = TRACK_CHANGE_GRACE
 # ===========================================================================
 # FIX 1 - Content-Length instead of chunked, and an unframed body
 # ===========================================================================
+def _range_start(headers):
+    """Start byte of a `Range: bytes=N-` request header, else None.
+
+    A speaker that lost the stream mid-way retries with a Range header asking
+    to resume where it was (observed: `RANGE: bytes=208901-` on a Playbar).
+    First fetches never carry one.
+    """
+    try:
+        value = headers.get('Range') or headers.get('RANGE') or ''
+        value = value.strip().lower()
+        if not value.startswith('bytes='):
+            return None
+        first = value[6:].split(',')[0].split('-')[0].strip()
+        return int(first) if first.isdigit() else None
+    except Exception:
+        return None
+
+
+def _http_ok_lines(mime_type, range_start=None):
+    """Response header lines. 206 with a Content-Range when resuming."""
+    if range_start is not None and 0 < range_start < FAKE_CONTENT_LENGTH:
+        return ['HTTP/1.1 206 Partial Content',
+                'Content-type: ' + mime_type,
+                'Connection: close',
+                'Accept-Ranges: bytes',
+                f'Content-Range: bytes {range_start}-{FAKE_CONTENT_LENGTH - 1}'
+                f'/{FAKE_CONTENT_LENGTH}',
+                f'Content-Length: {FAKE_CONTENT_LENGTH - range_start}',
+                '', '']
+    return ['HTTP/1.1 200 OK',
+            'Content-type: ' + mime_type,
+            'Connection: close',
+            'Accept-Ranges: bytes',
+            f'Content-Length: {FAKE_CONTENT_LENGTH}',
+            '', '']
+
+
 async def _write_http_ok(writer, renderer):
-    query = ['HTTP/1.1 200 OK',
-             'Content-type: ' + renderer.mime_type,
-             'Connection: close',
-             f'Content-Length: {FAKE_CONTENT_LENGTH}',
-             '', '']
+    # The request's Range (if any) is stashed on the renderer by the
+    # connection handler; Track.run calls us without request context.
+    range_start = getattr(renderer, '_sonomarchy_range_start', None)
+    renderer._sonomarchy_range_start = None
+    if range_start is not None:
+        logger.warning(f'{renderer.name}: speaker is resuming the stream at '
+                       f'byte {range_start}; answering 206 Partial Content')
+    query = _http_ok_lines(renderer.mime_type, range_start)
     writer.write('\r\n'.join(query).encode('latin-1'))
     await writer.drain()
 
@@ -736,6 +776,10 @@ async def _client_connected(self, reader, writer):
                                    f'{renderer.name} temporarily disabled')
                 break
 
+            # Resume request? Remember the start byte for the 206 answer.
+            renderer._sonomarchy_range_start = _range_start(
+                getattr(handler, 'headers', None) or {})
+
             if handler.command == 'HEAD':
                 await H.write_http_ok(writer, renderer)
                 return
@@ -760,6 +804,43 @@ async def _client_connected(self, reader, writer):
 
 
 _http_server.HTTPServer.client_connected = _client_connected
+
+
+# --- d) a connection reset must not remove the zone
+async def _track_run(self, reader):
+    """Mirror of pa-dlna 1.2 Track.run with one change.
+
+    Upstream answers a ConnectionError by closing the session AND the whole
+    renderer: the null-sink is unloaded and the zone vanishes from the sound
+    menu until the next discovery pass -- for a speaker that merely dropped
+    one HTTP connection. Observed on a Playbar retrying a broken stream:
+    reset after 2.4 s, "Closing renderer", zone gone. Close only the session;
+    the renderer, its sink and the application's stream stay, and the
+    speaker's retry or the resume sweep re-establishes the stream.
+    """
+    assert self.task is not None
+    renderer = self.session.renderer
+    try:
+        await _http_server.write_http_ok(self.writer, renderer)
+        _http_server.logger.debug(f'{self.task_name}: track is started')
+        await self.write_track(reader)
+        await self.shutdown()
+    except asyncio.CancelledError:
+        self.session.stream_tasks.create_task(self.shutdown(),
+                                              name='shutdown')
+    except ConnectionError as e:
+        logger.warning(f'{self.task_name}: speaker dropped the connection '
+                       f'({e!r}); keeping the zone, the stream will be '
+                       f're-established')
+        await self.session.close_session(shutdown_coro=True)
+    except Exception:
+        await self.session.close_session(shutdown_coro=True)
+        raise
+
+
+_wrap = getattr(_http_server, 'log_unhandled_exception', None)
+_http_server.Track.run = (_wrap(_http_server.logger)(_track_run)
+                          if callable(_wrap) else _track_run)
 
 
 # --- c) resume sweep

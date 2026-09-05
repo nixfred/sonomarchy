@@ -274,6 +274,81 @@ class StaleSinkCleanup(unittest.TestCase):
         self.assertEqual(unloaded, ['536870916', '536870918'])
 
 
+class RangeResume(unittest.TestCase):
+    """A speaker retrying a broken stream asks to resume with a Range header."""
+
+    def test_range_start_parsing(self):
+        m = load()
+        self.assertEqual(m._range_start({'RANGE': 'bytes=208901-'}), 208901)
+        self.assertEqual(m._range_start({'Range': 'bytes=0-'}), 0)
+        self.assertEqual(m._range_start({'Range': 'bytes=5-9,20-'}), 5)
+        self.assertIsNone(m._range_start({}))
+        self.assertIsNone(m._range_start({'Range': 'items=1-2'}))
+        self.assertIsNone(m._range_start({'Range': 'bytes=-500'}))   # suffix range: not a resume
+        self.assertIsNone(m._range_start(None))
+
+    def test_206_headers_only_for_a_real_resume(self):
+        m = load()
+        full = m._http_ok_lines('audio/mp3')
+        self.assertEqual(full[0], 'HTTP/1.1 200 OK')
+        self.assertIn(f'Content-Length: {m.FAKE_CONTENT_LENGTH}', full)
+        part = m._http_ok_lines('audio/mp3', 208901)
+        self.assertEqual(part[0], 'HTTP/1.1 206 Partial Content')
+        self.assertIn(f'Content-Range: bytes 208901-{m.FAKE_CONTENT_LENGTH - 1}/{m.FAKE_CONTENT_LENGTH}', part)
+        self.assertIn(f'Content-Length: {m.FAKE_CONTENT_LENGTH - 208901}', part)
+        # byte 0 is a plain fetch, not a resume
+        self.assertEqual(m._http_ok_lines('audio/mp3', 0)[0], 'HTTP/1.1 200 OK')
+        self.assertTrue(all(line.isascii() for line in part))
+
+
+class ResetKeepsZone(unittest.TestCase):
+    """A dropped HTTP connection closes the session, never the renderer."""
+
+    def run_track(self, m, failure):
+        events = []
+
+        class Renderer:
+            name = 'Office'
+            async def close(s): events.append('renderer.close')
+
+        class Session:
+            renderer = Renderer()
+            class stream_tasks:
+                @staticmethod
+                def create_task(coro, name=None): coro.close(); events.append('shutdown-task')
+            async def close_session(s, shutdown_coro=False): events.append(('close_session', shutdown_coro))
+
+        class Track:
+            task = object(); task_name = 'Office-track-1'; writer = object()
+            session = Session()
+            async def write_track(s, reader):
+                if failure: raise failure
+            async def shutdown(s): events.append('shutdown')
+
+        async def ok(writer, renderer): events.append('headers')
+        m._http_server.write_http_ok = ok
+        t = Track()
+        try:
+            asyncio.run(m._track_run(t, None))
+        except Exception as e:
+            events.append(('raised', type(e).__name__))
+        return events
+
+    def test_connection_reset_keeps_renderer(self):
+        m = load()
+        ev = self.run_track(m, ConnectionResetError('Connection lost'))
+        self.assertIn(('close_session', True), ev)
+        self.assertNotIn('renderer.close', ev)
+
+    def test_clean_end_and_other_errors_unchanged(self):
+        m = load()
+        self.assertEqual(self.run_track(m, None), ['headers', 'shutdown'])
+        ev = self.run_track(m, RuntimeError('boom'))
+        self.assertIn(('close_session', True), ev)
+        self.assertIn(('raised', 'RuntimeError'), ev)
+        self.assertNotIn('renderer.close', ev)
+
+
 class StreamResume(unittest.TestCase):
     """FIX 10: a dead stream must be able to come back."""
 
