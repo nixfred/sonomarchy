@@ -788,12 +788,15 @@ async def _maybe_resume(renderer, inputs_by_sink):
                    f'zone but no stream is running (transport {state}); '
                    f'restarting the stream')
     await sessions.stop_track()
-    if state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
-        try:
-            await renderer.stop()
-        except Exception:
-            pass
-        await _wait_until_stopped(renderer, timeout=3.0)
+    # Always send an explicit Stop, even when the transport already reads
+    # STOPPED: after a broken stream the player will not re-fetch the same
+    # URL on a bare Play, but it does after Stop -> SetAVTransportURI -> Play,
+    # which is exactly the sequence the manual "bounce" workaround produces.
+    try:
+        await renderer.stop()
+    except Exception as e:
+        logger.debug(f'{renderer.name}: Stop before resume: {e!r}')
+    await _wait_until_stopped(renderer, timeout=3.0)
     sink_input = renderer.nullsink.sink_input
     meta = renderer.sink_input_meta(sink_input) if sink_input is not None \
         else _pa_dlna.MetaData(apps[0], '', apps[0])
