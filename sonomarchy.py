@@ -191,14 +191,83 @@ def _http_ok_lines(mime_type, range_start=None):
             '', '']
 
 
+# --- replay buffer: make a Range retry a REAL resume ------------------------
+# A speaker that loses the connection asks for `Range: bytes=N-`, i.e. "carry
+# on from where I was". Observed on a Play:1: answering 206 with fresh live
+# data (which is not byte N) is rejected within 3 s with a reset. Keep the
+# last RING_BYTES of what was actually sent; if N is still in that window,
+# replay the missing bytes and continue live. Same bytes, same MP3 frames:
+# the speaker resumes without a gap and without a reset.
+RING_BYTES = 2 * 1024 * 1024        # ~65 s at 256 kbps
+
+
+class _Ring:
+    """Byte ring keyed by absolute stream offset."""
+
+    def __init__(self, capacity=RING_BYTES):
+        self.capacity = capacity
+        self.chunks = []            # list of (start_offset, bytes)
+        self.size = 0
+        self.end = 0                # absolute offset of the next byte
+
+    @property
+    def start(self):
+        return self.chunks[0][0] if self.chunks else self.end
+
+    def reset(self):
+        self.chunks, self.size, self.end = [], 0, 0
+
+    def append(self, data):
+        if not data:
+            return
+        self.chunks.append((self.end, data))
+        self.size += len(data)
+        self.end += len(data)
+        while self.size > self.capacity and len(self.chunks) > 1:
+            _, old = self.chunks.pop(0)
+            self.size -= len(old)
+
+    def since(self, offset):
+        """Bytes from absolute `offset` to the end, or None if not buffered."""
+        if offset < self.start or offset > self.end:
+            return None
+        out = []
+        for start, data in self.chunks:
+            if start + len(data) <= offset:
+                continue
+            out.append(data[max(0, offset - start):])
+        return b''.join(out)
+
+
+def _ring(renderer):
+    ring = getattr(renderer, '_sonomarchy_ring', None)
+    if ring is None:
+        ring = renderer._sonomarchy_ring = _Ring()
+    return ring
+
+
 async def _write_http_ok(writer, renderer):
     # The request's Range (if any) is stashed on the renderer by the
     # connection handler; Track.run calls us without request context.
     range_start = getattr(renderer, '_sonomarchy_range_start', None)
     renderer._sonomarchy_range_start = None
+    renderer._sonomarchy_replay = None
     if range_start is not None:
-        logger.warning(f'{renderer.name}: speaker is resuming the stream at '
-                       f'byte {range_start}; answering 206 Partial Content')
+        ring = _ring(renderer)
+        replay = ring.since(range_start)
+        if replay is not None:
+            renderer._sonomarchy_replay = (range_start, replay)
+            logger.warning(f'{renderer.name}: speaker is resuming at byte '
+                           f'{range_start}; replaying {len(replay)} buffered '
+                           f'bytes then continuing live (206)')
+        else:
+            # Outside the window: we cannot honour it. Start a fresh
+            # representation from byte 0 rather than lie about the offset.
+            logger.warning(f'{renderer.name}: speaker asked to resume at byte '
+                           f'{range_start} but only {ring.start}-{ring.end} is '
+                           f'buffered; starting a fresh stream (200)')
+            range_start = None
+            ring.reset()
     query = _http_ok_lines(renderer.mime_type, range_start)
     writer.write('\r\n'.join(query).encode('latin-1'))
     await writer.drain()
@@ -208,8 +277,19 @@ async def _write_track(self, reader):
     """Copy encoder stdout to the socket with no chunk framing.
 
     Mirrors upstream Track.write_track minus the chunk headers, because the
-    response we send is no longer Transfer-Encoding: chunked.
+    response we send is no longer Transfer-Encoding: chunked. Every byte sent
+    is also recorded in the renderer's replay ring; a resume request first
+    gets the buffered bytes it missed.
     """
+    renderer = self.session.renderer
+    ring = _ring(renderer)
+    replay = getattr(renderer, '_sonomarchy_replay', None)
+    renderer._sonomarchy_replay = None
+    if replay is not None:
+        _, missed = replay
+        if missed:
+            self.writer.write(missed)
+            await self.writer.drain()
     while True:
         partial_data = False
         if self.writer.is_closing():
@@ -221,6 +301,7 @@ async def _write_track(self, reader):
             data = e.partial
             partial_data = True
         if data:
+            ring.append(data)
             self.writer.write(data)
             await self.writer.drain()
         if not data or partial_data:
@@ -236,6 +317,19 @@ async def _write_track(self, reader):
 # call time, so rebinding the module attribute is enough.
 _http_server.write_http_ok = _write_http_ok
 _http_server.Track.write_track = _write_track
+
+# A new playback (SetAVTransportURI) starts a new byte stream at 0: the
+# speaker's offsets restart, so must ours.
+_orig_set_avtransporturi = _pa_dlna.Renderer.set_avtransporturi
+
+
+async def _set_avtransporturi(self, *args, **kwargs):
+    _ring(self).reset()
+    self._sonomarchy_replay = None
+    return await _orig_set_avtransporturi(self, *args, **kwargs)
+
+
+_pa_dlna.Renderer.set_avtransporturi = _set_avtransporturi
 
 
 # ===========================================================================
@@ -339,6 +433,7 @@ async def _firewall_probe(renderer):
 
 async def _play(self, *args, **kwargs):
     result = await _orig_play(self, *args, **kwargs)
+    _mark_started(self)
     try:
         _keep(asyncio.get_running_loop().create_task(_firewall_probe(self)))
     except Exception:
@@ -515,6 +610,7 @@ async def _register(self, renderer):
         except Exception as e:
             logger.debug(f'bonded-satellite check skipped: {e!r}')
     result = await _orig_register(self, renderer)
+    _mark_started(renderer)
     try:
         if renderer.nullsink is not None:
             emit('zone', uuid=uuid or renderer.upnp_device.UDN,
@@ -866,6 +962,25 @@ def _pactl_inputs_by_sink():
 
 
 _ACTIVE_STATES = ('PLAYING', 'TRANSITIONING')
+# Seconds after a zone registers or is told to Play during which the sweep
+# leaves it alone: the normal start sequence (SetAVTransportURI, Play, the
+# speaker's GET) takes a few seconds, and a sweep landing inside it would
+# issue a second, redundant restart -- an audible hiccup for nothing.
+RESUME_GRACE = 15
+
+
+def _mark_started(renderer):
+    try:
+        renderer._sonomarchy_started_at = time.monotonic()
+    except Exception:
+        pass
+
+
+def _in_start_grace(renderer, now=None):
+    started = getattr(renderer, '_sonomarchy_started_at', None)
+    if started is None:
+        return False
+    return (time.monotonic() if now is None else now) - started < RESUME_GRACE
 # A zone whose session is alive but whose sink has had no player for this many
 # consecutive sweeps is torn down. Two sweeps (16 s) outlasts the 10 s
 # track-change grace, so a player between songs is never cut off.
@@ -922,6 +1037,8 @@ async def _maybe_resume(renderer, inputs_by_sink):
             _idle_sweeps.pop(sink_name, None)
         return
     _idle_sweeps.pop(sink_name, None)
+    if _in_start_grace(renderer):
+        return                                   # a start is in flight
 
     # The speaker is the truth about whether audio is actually playing: a
     # session can look alive on our side while the zone reads STOPPED.
@@ -972,8 +1089,9 @@ async def _resume_loop(control_point):
                 except Exception as e:
                     candidates.append(f'{getattr(r, "name", "?")}: {e!r}')
             if candidates:
-                emit('sweep', zones=len(renderers), inputs=len(inputs),
-                     candidates=candidates)
+                emit('sweep',
+                     zones=sum(1 for r in renderers if r.nullsink is not None),
+                     inputs=len(inputs), candidates=candidates)
             for renderer in renderers:
                 try:
                     await _maybe_resume(renderer, inputs)

@@ -14,6 +14,12 @@
   sweep restarts any zone that has a player but no stream (for speakers
   that give up without retrying). Measured: resume in 150 ms via the retry,
   within 10 s via the sweep, zones stable throughout.
+- Fixed: a `Range` retry is now a real resume. The last ~65 s of encoded
+  audio is kept per zone; a speaker reconnecting with `Range: bytes=N-` is
+  sent the bytes it actually missed, then the live stream — no reset, no
+  gap (a Play:1 rejected a 206 that did not really continue the stream).
+- Fixed: the resume sweep leaves a zone alone for 15 s after it starts, so it
+  never issues a redundant restart while the normal start is in flight.
 - Fixed: after ending a Spotify Connect session the backend waits for the
   player to report STOPPED instead of sleeping a fixed second, which on a
   Play:1 collided with the player's own transition and produced the same 409.

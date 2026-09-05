@@ -274,6 +274,91 @@ class StaleSinkCleanup(unittest.TestCase):
         self.assertEqual(unloaded, ['536870916', '536870918'])
 
 
+class ReplayRing(unittest.TestCase):
+    """A Range retry is served with the real missing bytes, then live."""
+
+    def test_since_returns_exact_missing_bytes(self):
+        m = load()
+        r = m._Ring(capacity=100)
+        r.append(b'a' * 10); r.append(b'b' * 10); r.append(b'c' * 10)
+        self.assertEqual(r.end, 30)
+        self.assertEqual(r.since(0), b'a' * 10 + b'b' * 10 + b'c' * 10)
+        self.assertEqual(r.since(15), b'b' * 5 + b'c' * 10)
+        self.assertEqual(r.since(30), b'')                 # nothing missed
+        self.assertIsNone(r.since(31))                      # ahead of us
+        self.assertEqual(r.since(10), b'b' * 10 + b'c' * 10)
+
+    def test_eviction_keeps_a_window_and_refuses_older_offsets(self):
+        m = load()
+        r = m._Ring(capacity=25)
+        for ch in b'abcd':
+            r.append(bytes([ch]) * 10)
+        self.assertEqual(r.end, 40)
+        self.assertLessEqual(r.size, 30)                    # one chunk over cap at most
+        self.assertIsNone(r.since(5))                       # evicted
+        self.assertEqual(r.since(r.start), b''.join(d for _, d in r.chunks))
+
+    def test_reset_on_new_playback(self):
+        m = load()
+        r = m._Ring(); r.append(b'x' * 5); r.reset()
+        self.assertEqual((r.start, r.end, r.size), (0, 0, 0))
+        self.assertEqual(r.since(0), b'')
+
+    def test_write_track_replays_then_records(self):
+        m = load()
+        sent = []
+
+        class Writer:
+            def is_closing(s): return False
+            def write(s, b): sent.append(bytes(b))
+            async def drain(s): pass
+
+        class Reader:
+            def __init__(s, chunks): s.chunks = list(chunks)
+            async def readexactly(s, n):
+                if not s.chunks: raise asyncio.IncompleteReadError(b'', n)
+                return s.chunks.pop(0)
+
+        class Renderer:
+            name = 'Office'; mime_type = 'audio/mp3'
+        renderer = Renderer()
+
+        class Session:
+            track = None; is_playing = False       # a deliberate end, no unlatch
+        session = Session(); session.renderer = renderer
+
+        class Track:
+            task_name = 't'; writer = Writer()
+        t = Track(); t.session = session
+        m._http_server.HTTP_CHUNK_SIZE = 4
+        # first playback: bytes 0..7 sent and recorded
+        asyncio.run(m._write_track(t, Reader([b'0123', b'4567'])))
+        ring = m._ring(renderer)
+        self.assertEqual(ring.end, 8)
+        self.assertEqual(sent, [b'0123', b'4567'])
+        # speaker reconnects asking for byte 4-: the header step decides on the replay
+        renderer._sonomarchy_range_start = 4
+        hdr = []
+
+        class HW:
+            def write(s, b): hdr.append(bytes(b))
+            async def drain(s): pass
+        asyncio.run(m._write_http_ok(HW(), renderer))
+        self.assertIn(b'206 Partial Content', hdr[0])
+        self.assertEqual(renderer._sonomarchy_replay, (4, b'4567'))
+        # ... and the track first replays "4567", then streams live
+        sent.clear()
+        asyncio.run(m._write_track(t, Reader([b'89ab'])))
+        self.assertEqual(sent, [b'4567', b'89ab'])
+        self.assertEqual(ring.end, 12)
+        # a resume outside the window falls back to a fresh 200 and a reset ring
+        renderer._sonomarchy_range_start = 999
+        hdr.clear()
+        asyncio.run(m._write_http_ok(HW(), renderer))
+        self.assertIn(b'200 OK', hdr[0])
+        self.assertEqual(ring.end, 0)
+
+
 class RangeResume(unittest.TestCase):
     """A speaker retrying a broken stream asks to resume with a Range header."""
 
@@ -472,6 +557,16 @@ class StreamResume(unittest.TestCase):
         asyncio.run(m._maybe_resume(r, {'sink-office': ['cliamp']}))
         self.assertEqual(actions, ['stop_track', 'stop', ('start', 'cliamp')])
         self.assertEqual(r.nullsink.sink_input.index, 8)          # the one on our sink
+
+    def test_sweep_leaves_a_zone_alone_while_its_start_is_in_flight(self):
+        m = load(); actions = []
+        r = self.make_renderer(m, actions, False, False, 'STOPPED')
+        m._mark_started(r)                                   # Play just sent
+        asyncio.run(m._maybe_resume(r, {'sink-office': ['cliamp']}))
+        self.assertEqual(actions, [])
+        r._sonomarchy_started_at -= m.RESUME_GRACE + 1       # grace elapsed
+        asyncio.run(m._maybe_resume(r, {'sink-office': ['cliamp']}))
+        self.assertEqual(actions[:2], ['stop_track', 'stop'])
 
     def test_speaker_state_is_the_truth(self):
         # session looks alive on our side but the zone reads STOPPED: restart
