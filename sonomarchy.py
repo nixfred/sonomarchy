@@ -300,7 +300,7 @@ async def _firewall_probe(renderer):
 async def _play(self, *args, **kwargs):
     result = await _orig_play(self, *args, **kwargs)
     try:
-        asyncio.get_running_loop().create_task(_firewall_probe(self))
+        _keep(asyncio.get_running_loop().create_task(_firewall_probe(self)))
     except Exception:
         pass
     return result
@@ -811,23 +811,40 @@ async def _resume_loop(control_point):
                 try:
                     await _maybe_resume(renderer, inputs)
                 except Exception as e:
-                    logger.debug(f'resume check for {renderer.name} '
-                                 f'skipped: {e!r}')
+                    # WARNING on purpose: a silent failure here is exactly
+                    # the "sink is running but nothing plays" bug this
+                    # sweep exists to catch, so it must be visible.
+                    logger.warning(f'resume check for {renderer.name} '
+                                   f'skipped: {e!r}')
         except Exception as e:
-            logger.debug(f'resume sweep skipped: {e!r}')
+            logger.warning(f'resume sweep skipped: {e!r}')
+
+
+# asyncio keeps only WEAK references to tasks. A task whose handle is dropped
+# can be garbage-collected while still pending -- which is exactly how the
+# first version of this sweep silently never ran. Hold the handles.
+_resume_task = None
+_background_tasks = set()
+
+
+def _keep(task):
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def _ensure_resume_loop(control_point):
     """Start the sweep on pa-dlna's own event loop, once."""
-    global _resume_started
+    global _resume_started, _resume_task
     if _resume_started:
         return
     try:
-        asyncio.get_running_loop().create_task(_resume_loop(control_point),
-                                               name='sonomarchy-resume')
+        _resume_task = _keep(asyncio.get_running_loop().create_task(
+            _resume_loop(control_point), name='sonomarchy-resume'))
         _resume_started = True
+        logger.info('resume sweep started')
     except Exception as e:
-        logger.debug(f'resume loop not started: {e!r}')
+        logger.warning(f'resume loop not started: {e!r}')
 
 
 def main(argv=None):

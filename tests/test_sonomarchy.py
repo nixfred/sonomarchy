@@ -325,6 +325,30 @@ class StreamResume(unittest.TestCase):
         self.assertFalse(m._processes_alive(dead))
         self.assertFalse(m._processes_alive(None))
 
+    def test_resume_loop_handle_is_retained(self):
+        # asyncio only weakly references tasks; a dropped handle means the
+        # sweep can be garbage-collected while pending and never run.
+        m = load()
+        m.RESUME_INTERVAL = 0.01
+        seen = []
+        m._pactl_inputs_by_sink = lambda: (seen.append(1), {})[1]
+
+        class CP:
+            def renderers(self): return []
+
+        async def go():
+            m._ensure_resume_loop(CP())
+            self.assertIsNotNone(m._resume_task)
+            self.assertIn(m._resume_task, m._background_tasks)
+            await asyncio.sleep(0.1)
+            m._resume_task.cancel()
+            try:
+                await m._resume_task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(go())
+        self.assertGreater(len(seen), 0, 'sweep never ran')
+
     def test_resume_restarts_only_a_silent_zone_with_a_player(self):
         m = load()
         actions = []
