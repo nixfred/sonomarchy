@@ -119,6 +119,15 @@ Item {
         restartReason = plainText(message.reason, 64)
         state = "restarting"
         break
+      case "sweep":
+        // Only emitted when a zone has a player but no live stream.
+        console.warn("Sonomarchy: resume sweep found " + plainText(JSON.stringify(message.candidates), 300)
+          + " (" + message.zones + " zones, inputs on " + message.inputs + " sinks)")
+        break
+      case "resumed":
+        console.warn("Sonomarchy: restarted the stream for " + plainText(message.zone, 64)
+          + " (" + plainText(message.app, 64) + " was still playing)")
+        break
       case "cleanup":
         // Runs before pa-dlna configures its logging, so this is the only
         // place the event is visible.

@@ -807,7 +807,24 @@ async def _resume_loop(control_point):
         try:
             loop = asyncio.get_running_loop()
             inputs = await loop.run_in_executor(None, _pactl_inputs_by_sink)
-            for renderer in list(control_point.renderers()):
+            renderers = list(control_point.renderers())
+            # Report only when there is something to look at: zones that have
+            # a player but no live stream. Silent sweeps stay silent.
+            candidates = []
+            for r in renderers:
+                try:
+                    if (r.nullsink is not None
+                            and inputs.get(r.nullsink.sink.name)
+                            and not (r.stream_sessions.is_playing
+                                     and _processes_alive(
+                                         r.stream_sessions.processes))):
+                        candidates.append(r.description)
+                except Exception as e:
+                    candidates.append(f'{getattr(r, "name", "?")}: {e!r}')
+            if candidates:
+                emit('sweep', zones=len(renderers), inputs=len(inputs),
+                     candidates=candidates)
+            for renderer in renderers:
                 try:
                     await _maybe_resume(renderer, inputs)
                 except Exception as e:
@@ -842,7 +859,9 @@ def _ensure_resume_loop(control_point):
         _resume_task = _keep(asyncio.get_running_loop().create_task(
             _resume_loop(control_point), name='sonomarchy-resume'))
         _resume_started = True
-        logger.info('resume sweep started')
+        # WARNING so it reaches the shell journal once per backend start;
+        # the shell only forwards severe lines.
+        logger.warning('resume sweep started')
     except Exception as e:
         logger.warning(f'resume loop not started: {e!r}')
 
