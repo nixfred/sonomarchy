@@ -288,17 +288,24 @@ class StreamResume(unittest.TestCase):
         m = load()
         calls = []
 
+        class Procs:
+            async def close_encoder(s): calls.append('close_encoder')
+
         class Session:
             def __init__(s, track, playing):
-                s.track = track; s.is_playing = playing
-            async def stop_track(s): calls.append('stop')
+                s.track = track; s.is_playing = playing; s.processes = Procs()
+            async def stop_track(s):
+                # Upstream's stop_track cancels the track task. Called from
+                # inside that task it cancels the caller. Must never be used.
+                calls.append('stop_track'); asyncio.current_task().cancel(); await asyncio.sleep(0)
 
         class Track:
             task_name = 't'
             def __init__(s, session): s.session = session
-        t = Track(None); t.session = Session(t, True)
+        t = Track(None); s = t.session = Session(t, True)
         asyncio.run(m._unlatch_after_eof(t))
-        self.assertEqual(calls, ['stop'])
+        self.assertEqual(calls, ['close_encoder'])          # no self-cancel
+        self.assertFalse(s.is_playing); self.assertIsNone(s.track)
         calls.clear()
         t2 = Track(None); t2.session = Session(object(), True)   # a newer track owns the session
         asyncio.run(m._unlatch_after_eof(t2))

@@ -622,16 +622,28 @@ _resume_started = False
 
 
 async def _unlatch_after_eof(track):
-    """Clear a session whose track ended without a deliberate stop."""
+    """Clear a session whose track ended without a deliberate stop.
+
+    Runs INSIDE the track's own task, so it must not call
+    StreamSessions.stop_track(): that calls Track.stop(), which cancels the
+    track task -- i.e. cancels us, mid-cleanup, and leaves the session
+    half-closed. Mirror stop_track() minus the self-cancel: the track is
+    ending on its own anyway.
+    """
     session = track.session
     try:
         if session.track is track and session.is_playing:
             logger.warning(f'{track.task_name}: stream ended unexpectedly; '
                            f'clearing the session so the speaker can '
                            f'reconnect')
-            await session.stop_track()
+            session.is_playing = False
+            session.track = None
+            if session.processes is not None:
+                await session.processes.close_encoder()
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.debug(f'unlatch skipped: {e!r}')
+        logger.warning(f'{track.task_name}: unlatch after EOF failed: {e!r}')
 
 
 def _should_takeover(name, now):
