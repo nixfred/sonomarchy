@@ -104,7 +104,19 @@ PY
 done
 [[ -n "$http_port" ]] || setup_error "No free TCP port between $HTTP_PORT_FIRST and $HTTP_PORT_LAST for the audio stream."
 
-args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l info -u)
+# Support switch: `touch ~/.local/state/io.github.nixfred.sonomarchy/debug`
+# and restart the plugin to get a full DEBUG log of the backend at
+# .../backend.log (the shell journal only carries warnings and errors).
+# Remove the file and restart to turn it off. Never on by default: the file
+# grows for as long as the backend runs.
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/${PLUGIN_ID}"
+if [[ -f "$STATE_DIR/debug" ]]; then
+  mkdir -p "$STATE_DIR"
+  args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l debug -u -f "$STATE_DIR/backend.log")
+  printf 'sonomarchy: debug log enabled at %s\n' "$STATE_DIR/backend.log" >&2
+else
+  args=(--port "$http_port" --msearch-port "$SSDP_PORT" -l info -u)
+fi
 [[ -n "$nics" ]] && args+=(--nics "$nics")
 
 exec "$VENV_DIR/bin/python" -u "$PLUGIN_DIR/sonomarchy.py" "${args[@]}"
