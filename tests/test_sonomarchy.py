@@ -748,5 +748,73 @@ class FirewallRuleHint(unittest.TestCase):
         self.assertIsNone(m._arg_value(['x'], ['--port']))
 
 
+class TransientSinkInput(unittest.TestCase):
+    """FIX 12: a brief stream ending must not close someone else's stream."""
+
+    def make(self, m, closed, inputs, pointer_index):
+        class SinkInput:
+            def __init__(s, index, sink):
+                s.index = index; s.sink = sink
+                s.proplist = {'application.name': 'cliamp'}
+
+        class LibPulse:
+            async def pa_context_get_sink_input_info_list(s):
+                return [SinkInput(i, k) for i, k in inputs]
+
+        class Sessions:
+            async def close_session(s): closed.append('closed')
+
+        class Renderer:
+            name = 'Office'
+            control_point = type('CP', (), {
+                'pulse': type('PU', (), {'lib_pulse': LibPulse()})()})()
+            def __init__(s):
+                s.stream_sessions = Sessions()
+                s.nullsink = type('N', (), {
+                    'sink': type('K', (), {'name': 'sink-office',
+                                           'index': 42})(),
+                    'sink_input': SinkInput(pointer_index, 42)})()
+            def get_sink_input_index(s):
+                si = s.nullsink.sink_input
+                return None if si is None else si.index
+            def log_pulse_event(s, *a): closed.append('ignored')
+            async def stop(s): pass
+        return Renderer()
+
+    def test_transient_removal_spares_the_stream_that_is_still_playing(self):
+        m = load(); m.TRACK_CHANGE_GRACE = 0
+        closed = []
+        # The pointer names the transient 10570, which has gone; 8210 is the
+        # real stream and is still on our sink. This is the observed bug.
+        r = self.make(m, closed, inputs=[(8210, 42)], pointer_index=10570)
+        asyncio.run(m._maybe_stop(r, 10570, 'PLAYING'))
+        self.assertEqual(closed, ['ignored'])
+        self.assertEqual(r.nullsink.sink_input.index, 8210)
+
+    def test_a_genuinely_idle_zone_is_still_torn_down(self):
+        m = load(); m.TRACK_CHANGE_GRACE = 0
+        closed = []
+        # Nothing left on our sink: this must still close, or the encoder
+        # leaks for as long as the renderer lives.
+        r = self.make(m, closed, inputs=[], pointer_index=10570)
+        asyncio.run(m._maybe_stop(r, 10570, 'PLAYING'))
+        self.assertEqual(closed, ['closed'])
+
+    def test_input_on_another_sink_does_not_count_as_busy(self):
+        m = load(); m.TRACK_CHANGE_GRACE = 0
+        closed = []
+        r = self.make(m, closed, inputs=[(999, 77)], pointer_index=10570)
+        asyncio.run(m._maybe_stop(r, 10570, 'PLAYING'))
+        self.assertEqual(closed, ['closed'])
+
+    def test_upstream_fast_path_still_wins(self):
+        m = load(); m.TRACK_CHANGE_GRACE = 0
+        closed = []
+        # A replacement announced itself in time: pointer already moved on.
+        r = self.make(m, closed, inputs=[(8211, 42)], pointer_index=8211)
+        asyncio.run(m._maybe_stop(r, 10570, 'PLAYING'))
+        self.assertEqual(closed, ['ignored'])
+
+
 if __name__ == '__main__':
     unittest.main()

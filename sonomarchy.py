@@ -152,6 +152,72 @@ _pa_dlna.ISSUE_48_TIMER = TRACK_CHANGE_GRACE
 
 
 # ===========================================================================
+# FIX 12 - a short-lived sink-input must not tear down the real one
+# ===========================================================================
+# Upstream decides a zone has gone idle from one pointer, nullsink.sink_input,
+# which follows whichever sink-input last raised a pulse event. Any brief
+# stream -- a notification, a UI sound, a player reopening its PCM -- captures
+# that pointer just by existing. When the brief stream ends, `maybe_stop` sees
+# the pointer still naming it, concludes the zone is idle, and closes the
+# encoder out from under a completely different stream that never stopped.
+#
+# Observed 2026-09-06 with a player running for an hour on sink-input 8210:
+#
+#   23:58:12  'change' pulse event  [sink-input index 10570]   <- transient
+#   23:58:31  'remove' pulse event  [sink-input index 10570]
+#   23:58:41  'Closing-Stop'                                   <- 8210 killed
+#   23:58:48  sweep: "cliamp is playing into the zone but the stream is not"
+#
+# The music stopped for ~17 s per occurrence and the sweep put it back, so the
+# symptom is a stutter every few minutes rather than an outright failure.
+# Raising TRACK_CHANGE_GRACE cannot fix it: no further event is coming for
+# 8210, so a longer wait only makes the gap longer.
+#
+# The zone is busy if ANYTHING is still playing into it, so ask the sink
+# rather than trusting the pointer.
+_orig_maybe_stop = _pa_dlna.Renderer.maybe_stop
+
+
+async def _maybe_stop(self, index, state):
+    await asyncio.sleep(TRACK_CHANGE_GRACE)
+    if self.nullsink is None:                    # renderer closed meanwhile
+        return
+    try:
+        cur_index = self.get_sink_input_index()
+        if cur_index is not None and cur_index != index:
+            # Upstream's own check: a replacement announced itself in time.
+            self.log_pulse_event('remove ignored', self.nullsink.sink_input)
+            return
+
+        adopted = await _adopt_sink_input(self)
+        if adopted is not None and adopted.index != index:
+            self.log_pulse_event('remove ignored', adopted)
+            return
+
+        self.nullsink.sink_input = None
+        _pa_dlna.log_action(self.name, 'Closing-Stop', state)
+        await self.stream_sessions.close_session()
+        _pa_dlna.log_action(self.name, 'Stop', state)
+        try:
+            await self.stop()
+        except Exception:
+            pass
+    except Exception as e:
+        # A failure here must not leave the stream running forever: fall back
+        # to upstream's behaviour rather than silently keeping the encoder.
+        logger.warning(f'{self.name}: idle check failed ({e!r}); '
+                       f'closing the session')
+        try:
+            self.nullsink.sink_input = None
+            await self.stream_sessions.close_session()
+        except Exception:
+            pass
+
+
+_pa_dlna.Renderer.maybe_stop = _maybe_stop
+
+
+# ===========================================================================
 # FIX 1 - Content-Length instead of chunked, and an unframed body
 # ===========================================================================
 def _range_start(headers):

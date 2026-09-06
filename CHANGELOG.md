@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.6 — 2026-09-06
+
+Music stuttered every few minutes: roughly 17 seconds of silence, then the
+resume sweep put it back. It was not the network and not the speaker.
+
+- Fixed: a short-lived sink-input tore down a completely different stream.
+  pa-dlna decides a zone is idle from one pointer that follows whichever
+  sink-input last raised an event, so any brief stream — a notification, a
+  UI sound, a player reopening its PCM — captures it. When the brief stream
+  ends, the idle check sees the pointer naming it and closes the encoder out
+  from under the stream that never stopped. Caught in the debug log: input
+  10570 lived 19 s, was removed, and took down input 8210, which had been
+  playing for the previous hour. The idle check now asks the sink whether
+  anything is still playing into it instead of trusting the pointer, and
+  adopts whatever it finds. Raising `TRACK_CHANGE_GRACE` could not have
+  fixed this — no further event was ever coming for 8210, so a longer wait
+  only made the gap longer.
+
 ## 0.1.5 — 2026-09-05
 
 - Fixed: 0.1.4's startup firewall hint never appeared. It was logged at INFO,
