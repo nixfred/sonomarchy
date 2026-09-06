@@ -53,7 +53,22 @@ ufw allow proto udp from 192.168.1.0/24 to any port 8081 comment 'Sonomarchy dis
 ```
 
 The plugin itself never touches the firewall or asks for elevated rights;
-these rules are yours to add once.
+these rules are yours to add once. It does work out the exact command for
+you: if a firewall service is running, the backend logs the rule for **your**
+subnet and **your** ports at startup, so you can copy it rather than adapt
+the example above —
+
+```
+ufw is running. If a zone is selectable but silent, the speakers need to
+reach this machine on 10.0.0.0/24: ufw allow proto tcp from 10.0.0.0/24 to
+any port 8080 comment 'Sonomarchy stream' && ufw allow proto udp from
+10.0.0.0/24 to any port 8081 comment 'Sonomarchy discovery'
+```
+
+`firewalld` gets `firewall-cmd` syntax. Note what this does *not* claim:
+reading firewall rules needs privileges the plugin does not have, so it can
+only tell you a firewall is running and what the rule would be — never that
+your port is actually blocked.
 
 8080/tcp is where the speakers fetch the stream (the first free port from
 8080–8089 is used; the OSD tells you which if it isn't 8080). 8081/udp is where

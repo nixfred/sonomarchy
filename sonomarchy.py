@@ -491,11 +491,18 @@ async def _firewall_probe(renderer):
                      f'claiming your LAN subnet is the next one -- check '
                      f'`ip route get {peer} from {host}` points at the '
                      f'interface facing the speaker')
+            # Say it with this machine's own subnet and port rather than the
+            # README's example: the reader is looking at a silent speaker and
+            # should not have to translate anything.
+            rules = _firewall_rules(_active_firewall(), _lan_cidr(host),
+                                    port, _msearch_port())
+            if rules:
+                cause += '. As root: ' + ' && '.join(rules)
         logger.warning(f'{renderer.name}: told to Play {FIREWALL_GRACE}s ago '
                        f'and never fetched the stream from TCP port {port}; '
                        f'{cause}')
         emit('firewall_suspected', port=port, zone=renderer.description,
-             host=host, reply_dev=dev)
+             host=host, reply_dev=dev, subnet=_lan_cidr(host))
     except Exception as e:
         logger.debug(f'firewall probe skipped: {e!r}')
 
@@ -511,6 +518,153 @@ async def _play(self, *args, **kwargs):
 
 
 _pa_dlna.Renderer.play = _play
+
+
+# ===========================================================================
+# FIX 11 - name the exact firewall rule, for this machine and this subnet
+# ===========================================================================
+# The README has always told people to open two ports, and FIX 8 tells them
+# again once a speaker has failed to fetch. Both said it in the abstract:
+# the reader still had to work out their own subnet, their own port (8080 is
+# only the first choice of ten) and their own firewall's syntax. That is
+# three chances to get it wrong while the speakers sit there silent.
+#
+# What we can establish without root, and what we deliberately do not claim:
+# `systemctl is-active` answers for anyone, so we can see that a firewall is
+# RUNNING. Reading its rules needs privileges we do not have and will not
+# ask for, so we can never say the port IS blocked -- only that something is
+# in a position to block it, and exactly what to type if it is.
+_FIREWALL_UNITS = ('ufw', 'firewalld', 'nftables', 'iptables')
+
+
+def _active_firewall():
+    """Name of a running firewall service, or None. Unprivileged."""
+    import subprocess
+    for unit in _FIREWALL_UNITS:
+        try:
+            done = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                                  capture_output=True, timeout=2)
+        except Exception as e:
+            logger.debug(f'firewall unit check skipped ({unit}): {e!r}')
+            continue
+        if done.returncode == 0:
+            return unit
+    return None
+
+
+def _lan_cidr(host):
+    """The CIDR of the interface that holds `host`, e.g. '10.0.0.0/24'.
+
+    Returned as the network address, never the host address: it is going
+    into a firewall rule as a source range.
+    """
+    import ipaddress
+    import psutil
+    import socket
+
+    try:
+        for _name, snics in psutil.net_if_addrs().items():
+            for snic in snics:
+                if (snic.family == socket.AF_INET
+                        and snic.address == host and snic.netmask):
+                    return str(ipaddress.ip_network(
+                        f'{host}/{snic.netmask}', strict=False))
+    except Exception as e:
+        logger.debug(f'subnet lookup failed for {host}: {e!r}')
+    return None
+
+
+def _firewall_rules(firewall, cidr, tcp_port, udp_port):
+    """The exact commands this machine needs, or [] if we cannot be exact.
+
+    ufw syntax is the fallback for unknown firewalls because it is what the
+    README documents; a wrong-syntax hint is worse than none, so anything we
+    cannot render precisely returns nothing at all.
+    """
+    if not cidr or not tcp_port:
+        return []
+    if firewall == 'firewalld':
+        rules = [f"firewall-cmd --permanent --add-rich-rule='rule family=ipv4"
+                 f" source address={cidr} port port={tcp_port}"
+                 f" protocol=tcp accept'"]
+        if udp_port:
+            rules.append(f"firewall-cmd --permanent --add-rich-rule='rule"
+                         f" family=ipv4 source address={cidr} port"
+                         f" port={udp_port} protocol=udp accept'")
+        rules.append('firewall-cmd --reload')
+        return rules
+    # Everything else gets ufw syntax: it is what the README documents, and
+    # an nftables user reading a ufw line still learns the port, protocol and
+    # source range they need, which is the part that is machine-specific.
+    rules = [f'ufw allow proto tcp from {cidr} to any port {tcp_port}'
+             f" comment 'Sonomarchy stream'"]
+    if udp_port:
+        rules.append(f'ufw allow proto udp from {cidr} to any port'
+                     f" {udp_port} comment 'Sonomarchy discovery'")
+    return rules
+
+
+def _arg_value(argv, names):
+    """Value of the first of `names` present in argv, as an int, or None."""
+    for i, arg in enumerate(argv):
+        for name in names:
+            if arg == name and i + 1 < len(argv):
+                candidate = argv[i + 1]
+            elif arg.startswith(name + '='):
+                candidate = arg.split('=', 1)[1]
+            else:
+                continue
+            try:
+                return int(candidate)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _msearch_port():
+    """The UDP port speakers answer discovery on, read from our own argv.
+
+    Read on demand rather than cached in a global: it is needed only on the
+    failure path, and state that exists solely to serve an error message is
+    state that can go stale without anyone noticing.
+    """
+    return _arg_value(sys.argv, ['--msearch-port', '-p'])
+
+
+def _firewall_advice(argv):
+    """(rules, firewall, cidr) for this machine right now; rules may be []."""
+    nics = _nics_from_argv(argv)
+    try:
+        addresses = sorted(_current_ipv4(nics))
+    except Exception as e:
+        logger.debug(f'firewall advice found no address: {e!r}')
+        addresses = []
+    host = addresses[0] if addresses else None
+    cidr = _lan_cidr(host) if host else None
+    firewall = _active_firewall()
+    tcp_port = _arg_value(argv, ['--port'])
+    udp_port = _arg_value(argv, ['--msearch-port', '-p'])
+    return _firewall_rules(firewall, cidr, tcp_port, udp_port), firewall, cidr
+
+
+def _announce_firewall_rules(argv):
+    """Log the rule this machine needs, once, at startup.
+
+    Log only -- no OSD. A running firewall is not itself a fault, and most
+    people have already allowed the ports. The notification belongs to FIX 8,
+    which fires only when a speaker has actually failed to fetch.
+    """
+    try:
+        rules, firewall, cidr = _firewall_advice(argv)
+        if not rules or not firewall:
+            return
+        logger.info(
+            f'{firewall} is running. If a zone is selectable but silent, '
+            f'the speakers need to reach this machine on {cidr}: '
+            + ' && '.join(rules))
+        emit('firewall_rules', firewall=firewall, subnet=cidr, rules=rules)
+    except Exception as e:
+        logger.debug(f'firewall rule announcement skipped: {e!r}')
 
 
 # ===========================================================================
@@ -1262,6 +1416,7 @@ def main(argv=None):
     argv = sys.argv if argv is None else argv
     emit('starting', version=VERSION)
     _unload_stale_sinks()
+    _announce_firewall_rules(argv)
     threading.Thread(target=_watch_addresses,
                      args=(_nics_from_argv(argv),),
                      name='address-watch',

@@ -114,6 +114,12 @@ Item {
         // reply, not a firewall, and saying "firewall" sends people to the
         // wrong place — so name what was actually observed.
         var viaTunnel = message.reply_dev ? String(message.reply_dev) : ""
+        // subnet is this machine's own LAN range, so the advice names what
+        // the user must actually type instead of a README example.
+        var subnet = message.subnet ? plainText(String(message.subnet), 24) : ""
+        var allow = subnet
+          ? " — allow tcp " + message.port + " from " + subnet + " (exact command in the log)"
+          : " — allow it in your firewall"
         lastError = viaTunnel
           ? "Sonos never fetched the stream on port " + message.port + " — a VPN (" + plainText(viaTunnel, 16) + ") is claiming your LAN"
           : "Sonos never fetched the stream on port " + message.port + " — a firewall is probably blocking it"
@@ -122,7 +128,7 @@ Item {
           notify("volume-muted", "Sonomarchy: " + plainText(message.zone, 40)
             + (viaTunnel
                ? " is unreachable — replies leave via " + plainText(viaTunnel, 16) + ", not your LAN"
-               : " can't reach port " + message.port + " — allow it in your firewall"))
+               : " can't reach port " + message.port + allow))
         }
         break
       }

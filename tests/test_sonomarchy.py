@@ -705,5 +705,48 @@ class ReplyRoute(unittest.TestCase):
             self.assertFalse(dev.startswith(m._TUNNEL_PREFIXES), dev)
 
 
+class FirewallRuleHint(unittest.TestCase):
+    """FIX 11 must be exact about this machine, or say nothing at all."""
+
+    def test_ufw_rules_name_subnet_and_both_ports(self):
+        m = load()
+        rules = m._firewall_rules('ufw', '10.0.0.0/24', 8083, 8081)
+        self.assertEqual(len(rules), 2)
+        self.assertIn('proto tcp from 10.0.0.0/24 to any port 8083', rules[0])
+        self.assertIn('proto udp from 10.0.0.0/24 to any port 8081', rules[1])
+
+    def test_firewalld_gets_firewalld_syntax(self):
+        m = load()
+        rules = m._firewall_rules('firewalld', '192.168.1.0/24', 8080, 8081)
+        self.assertTrue(all(r.startswith('firewall-cmd') for r in rules))
+        self.assertIn('source address=192.168.1.0/24', rules[0])
+        self.assertEqual(rules[-1], 'firewall-cmd --reload')
+
+    def test_unknown_subnet_or_port_yields_nothing(self):
+        m = load()
+        # Silence beats a rule with a placeholder in it: a half-right command
+        # pasted as root is worse than no command.
+        self.assertEqual(m._firewall_rules('ufw', None, 8080, 8081), [])
+        self.assertEqual(m._firewall_rules('ufw', '10.0.0.0/24', None, 8081), [])
+
+    def test_udp_port_is_optional(self):
+        m = load()
+        rules = m._firewall_rules('ufw', '10.0.0.0/24', 8080, None)
+        self.assertEqual(len(rules), 1)
+
+    def test_subnet_is_the_network_not_the_host(self):
+        m = load()
+        # A rule sourced from a /32 would let exactly one speaker in.
+        self.assertEqual(m._lan_cidr('127.0.0.1'), '127.0.0.0/8')
+
+    def test_port_parsing_handles_both_spellings(self):
+        m = load()
+        self.assertEqual(m._arg_value(['x', '--port', '8085'], ['--port']), 8085)
+        self.assertEqual(m._arg_value(['x', '--port=8085'], ['--port']), 8085)
+        self.assertEqual(m._arg_value(['x', '-p', '8081'], ['-p']), 8081)
+        self.assertIsNone(m._arg_value(['x', '--port', 'wat'], ['--port']))
+        self.assertIsNone(m._arg_value(['x'], ['--port']))
+
+
 if __name__ == '__main__':
     unittest.main()

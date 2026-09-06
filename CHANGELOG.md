@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.4 — 2026-09-05
+
+The firewall advice was correct and useless in the same breath: it named two
+ports but left the reader to work out their own subnet, their own port (8080
+is only the first choice of ten) and their own firewall's syntax — three
+chances to get it wrong while the speakers sit there silent.
+
+- Added: at startup, if a firewall service is running, the backend logs the
+  exact rule for this machine's subnet and ports, ready to paste. `ufw` and
+  `firewalld` syntax; log only, no notification, since a running firewall is
+  not itself a fault.
+- Added: FIX 8's warning now ends with that same exact command, so the
+  moment a speaker fails to fetch, the fix is on the screen rather than in
+  the README.
+- Added: the OSD names the port and subnet to allow instead of saying
+  "allow it in your firewall".
+- Deliberately not done: the plugin still never reads or writes firewall
+  rules and asks for no elevated rights. Reading them needs privileges we do
+  not have, so it can only report that a firewall is *running* and what the
+  rule would be — never that the port is actually blocked. A hint that
+  overstated its evidence is what sent this project's own author hunting the
+  wrong cause for an hour.
+
 ## 0.1.3 — 2026-09-05
 
 A VPN that advertises your LAN subnet breaks playback in a way that is
