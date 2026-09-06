@@ -434,9 +434,38 @@ _pa_dlna.Renderer.handle_action = _handle_action
 
 
 # ===========================================================================
-# FIX 8 - detect a firewall eating the stream
+# FIX 8 - detect a firewall (or a VPN route) eating the stream
 # ===========================================================================
 _orig_play = _pa_dlna.Renderer.play
+
+# Interfaces that can never carry the reply to a speaker on the LAN. If the
+# route back to the speaker leaves through one of these, our SYN-ACK goes
+# into a tunnel and the speaker never sees it: the symptom is identical to a
+# firewall drop, so the two have to be told apart or the log sends people
+# hunting the wrong one. Observed on 2026-09-05 on a laptop whose Tailscale
+# had accepted a subnet route for the very LAN it was sitting on -- inbound
+# SYNs arrived on ethernet, every SYN-ACK left via tailscale0 and died.
+_TUNNEL_PREFIXES = ('tailscale', 'wg', 'tun', 'ppp', 'zt', 'utun', 'nebula')
+
+
+def _reply_route(host, peer):
+    """Name of the interface a reply from `host` to `peer` would leave by.
+
+    Returns None when it cannot be determined; the caller must treat that as
+    "no opinion" and fall back to the generic advice.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(['ip', 'route', 'get', peer, 'from', host],
+                             capture_output=True, text=True,
+                             timeout=2).stdout.split()
+    except Exception as e:
+        logger.debug(f'reply route lookup failed: {e!r}')
+        return None
+    for i, word in enumerate(out):
+        if word == 'dev' and i + 1 < len(out):
+            return out[i + 1]
+    return None
 
 
 async def _firewall_probe(renderer):
@@ -447,11 +476,26 @@ async def _firewall_probe(renderer):
         if renderer.stream_sessions.is_playing:  # the speaker fetched it
             return
         port = renderer.control_point.port
+        host = renderer.root_device.local_ipaddress
+        peer = renderer.root_device.peer_ipaddress
+        dev = _reply_route(host, peer)
+        if dev and dev.startswith(_TUNNEL_PREFIXES):
+            cause = (f'the reply to {peer} is routed out {dev}, which the '
+                     f'speaker cannot be reached through -- a VPN is '
+                     f'claiming your LAN subnet. Check `ip route get {peer} '
+                     f'from {host}`; for Tailscale, a subnet router is '
+                     f'advertising this LAN and `tailscale set '
+                     f'--accept-routes=false` drops it')
+        else:
+            cause = (f'a firewall on this machine is the usual cause; a VPN '
+                     f'claiming your LAN subnet is the next one -- check '
+                     f'`ip route get {peer} from {host}` points at the '
+                     f'interface facing the speaker')
         logger.warning(f'{renderer.name}: told to Play {FIREWALL_GRACE}s ago '
                        f'and never fetched the stream from TCP port {port}; '
-                       f'a firewall on this machine is the usual cause')
+                       f'{cause}')
         emit('firewall_suspected', port=port, zone=renderer.description,
-             host=renderer.root_device.local_ipaddress)
+             host=host, reply_dev=dev)
     except Exception as e:
         logger.debug(f'firewall probe skipped: {e!r}')
 

@@ -60,6 +60,36 @@ these rules are yours to add once.
 speakers answer discovery. If a speaker is told to play and never fetches the
 stream, Sonomarchy shows an OSD naming the port.
 
+### VPN subnet routes — the #2 cause, and it looks exactly like a firewall
+
+If the ports are open and a speaker still never fetches the stream, check
+routing before touching the firewall again. A VPN that advertises your **LAN
+subnet** will pull the reply into the tunnel: the speaker's SYN arrives on
+your real interface, your SYN-ACK leaves through the VPN, and the handshake
+never completes. Nothing is logged, and every firewall rule looks correct.
+
+```bash
+ip route get <speaker-ip> from <your-ip>   # must name your LAN interface
+```
+
+If that prints a tunnel (`tailscale0`, `wg0`, `tun0`...), that is your fault
+line. With Tailscale it means a subnet router on your tailnet advertises the
+LAN you are already sitting on. Fix it at the source by dropping the
+advertisement on that node, which helps every device on the tailnet:
+
+```bash
+tailscale set --advertise-routes=          # on the subnet router
+```
+
+Or, on this machine only, stop accepting advertised routes:
+
+```bash
+tailscale set --accept-routes=false
+```
+
+Sonomarchy detects this case and names the interface in the log and OSD
+instead of blaming the firewall.
+
 ## Install
 
 ```bash

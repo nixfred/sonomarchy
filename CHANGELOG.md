@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.3 — 2026-09-05
+
+A VPN that advertises your LAN subnet breaks playback in a way that is
+indistinguishable, from the outside, from a blocked firewall port — and FIX 8
+confidently blamed the firewall. Found on a laptop whose Tailscale had
+accepted a subnet route for the LAN it was already sitting on: the speaker's
+SYN arrived on ethernet, every SYN-ACK was routed into `tailscale0` and died
+there, so the handshake never completed. Ports were open, rules were correct,
+and the log pointed at the wrong thing.
+
+- Fixed: FIX 8 now asks `ip route get <speaker> from <host>` before it
+  accuses the firewall. If the reply leaves through a tunnel
+  (`tailscale*`, `wg*`, `tun*`, `ppp*`, `zt*`, `utun*`, `nebula*`) the
+  warning names that interface and the fix; otherwise it gives the firewall
+  advice as before, now with routing named as the next thing to check. When
+  the route cannot be determined the probe has no opinion and falls back.
+- Fixed: the OSD and `lastError` said "a firewall is probably blocking it"
+  unconditionally. They follow the same distinction via a new `reply_dev`
+  field on the `firewall_suspected` event.
+- Added: a README section on VPN subnet routes, with the one-line check and
+  both fixes — dropping the advertisement on the subnet router (helps every
+  device on the tailnet) or `--accept-routes=false` on the one machine.
+- Added: tests for the route parser and the tunnel classifier, including
+  that ordinary interface names are never flagged — a false positive there
+  would reproduce this same bug in mirror image.
+
 ## 0.1.2 — 2026-09-04
 
 Fixes from an independent adversarial review (Codex), each confirmed in the

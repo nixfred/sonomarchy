@@ -108,14 +108,24 @@ Item {
         zones = remaining
         break
       }
-      case "firewall_suspected":
-        lastError = "Sonos never fetched the stream on port " + message.port + " — a firewall is probably blocking it"
+      case "firewall_suspected": {
+        // reply_dev is set only when the backend found the route back to the
+        // speaker leaving through a tunnel. That is a VPN swallowing the
+        // reply, not a firewall, and saying "firewall" sends people to the
+        // wrong place — so name what was actually observed.
+        var viaTunnel = message.reply_dev ? String(message.reply_dev) : ""
+        lastError = viaTunnel
+          ? "Sonos never fetched the stream on port " + message.port + " — a VPN (" + plainText(viaTunnel, 16) + ") is claiming your LAN"
+          : "Sonos never fetched the stream on port " + message.port + " — a firewall is probably blocking it"
         if (!firewallWarned) {
           firewallWarned = true
           notify("volume-muted", "Sonomarchy: " + plainText(message.zone, 40)
-            + " can't reach port " + message.port + " — allow it in your firewall")
+            + (viaTunnel
+               ? " is unreachable — replies leave via " + plainText(viaTunnel, 16) + ", not your LAN"
+               : " can't reach port " + message.port + " — allow it in your firewall"))
         }
         break
+      }
       case "restart":
         restartReason = plainText(message.reason, 64)
         state = "restarting"

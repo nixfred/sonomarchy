@@ -675,5 +675,35 @@ class ArgvParsing(unittest.TestCase):
         self.assertIsNone(m._nics_from_argv(['x', '--port', '8080']))
 
 
+class ReplyRoute(unittest.TestCase):
+    """FIX 8 has to tell a firewall drop from a VPN swallowing the reply."""
+
+    def test_loopback_route_is_lo(self):
+        m = load()
+        # Exercised against real `ip route get` output rather than a fixture,
+        # so the parser cannot drift from the tool it parses. The loopback
+        # route exists on every Linux box.
+        self.assertEqual(m._reply_route('127.0.0.1', '127.0.0.1'), 'lo')
+
+    def test_unresolvable_destination_is_no_opinion(self):
+        m = load()
+        # Must return None, not raise and not guess: the caller falls back to
+        # the generic advice when the route cannot be determined.
+        self.assertIsNone(m._reply_route('127.0.0.1', 'not-an-ip'))
+
+    def test_tunnel_interfaces_are_recognised(self):
+        m = load()
+        for dev in ('tailscale0', 'wg0', 'tun0', 'ppp0', 'nebula1', 'utun3'):
+            self.assertTrue(dev.startswith(m._TUNNEL_PREFIXES), dev)
+
+    def test_real_interfaces_are_not_flagged(self):
+        m = load()
+        # A false positive here would blame a VPN for a genuine firewall
+        # drop, which is the exact mistake this change exists to stop.
+        for dev in ('eth0', 'enp0s20f0u4c2', 'wlp2s0', 'wlo1', 'eno1',
+                    'br-lan', 'lo'):
+            self.assertFalse(dev.startswith(m._TUNNEL_PREFIXES), dev)
+
+
 if __name__ == '__main__':
     unittest.main()
