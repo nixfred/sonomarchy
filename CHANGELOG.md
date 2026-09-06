@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.7 — 2026-09-06
+
+Grouped rooms are one output now, instead of one broken sink per room.
+
+- Added: a Sonos group appears as a single output named after every room in
+  it ("Living Room + Office"). Only the group's coordinator gets a sink;
+  Sonos relays the stream to the other rooms itself. Previously every member
+  got its own sink, and selecting a follower did not play to the group — a
+  `SetAVTransportURI` to a grouped member pulls it *out* of the group and
+  plays it alone, the opposite of what grouping the rooms asked for.
+  The label is alphabetical rather than coordinator-first, because Sonos
+  reassigns the coordinator on its own and the output would otherwise be
+  renamed for no visible reason.
+- Added: the grouping is watched while running (every 15 s). Group or
+  ungroup in the Sonos app and the outputs are rebuilt to match, by exiting
+  for the shell to restart — the same mechanism an address change uses. A
+  change has to hold for two polls before it counts, because Sonos reports
+  transient groupings mid-regroup, and the rebuild waits for playback to end
+  rather than cutting the music: Sonos keeps a group in sync with its
+  coordinator, so audio in flight is unaffected either way. Speakers that
+  stop answering are never mistaken for a regrouping.
+- Fixed: the zone topology was HTML-unescaped twice by hand, which mangled
+  any room name containing an "&". It is now unescaped exactly once, by the
+  XML parser.
+- Fixed: `VERSION` in the backend still said 0.1.2 while the manifest said
+  0.1.6, so the `starting` event reported a version four releases old.
+
 ## 0.1.6 — 2026-09-06
 
 Music stuttered every few minutes: roughly 17 seconds of silence, then the

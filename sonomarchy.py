@@ -79,6 +79,7 @@ slip through appear as a duplicate room in the sound menu that silently does
 nothing. ZoneGroupTopology marks them Invisible="1"; ask once, cache, skip.
 Note the embedded MediaRenderer UDN carries a role suffix (`..._MR`) that the
 topology does not use; compare the bare player id or nothing ever matches.
+See also FIX 13, which reads the same topology for grouping.
 
 --------------------------------------------------------------------------
 FIX 6 - a readable name in the sound menu
@@ -116,7 +117,7 @@ import time
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 
-VERSION = '0.1.2'
+VERSION = '0.1.7'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -133,6 +134,9 @@ TRACK_CHANGE_GRACE = 10
 # Seconds a speaker gets to fetch the stream after Play before we suspect a
 # firewall (FIX 8). A healthy speaker fetches within ~100 ms.
 FIREWALL_GRACE = 8
+
+# Seconds between Sonos grouping checks (FIX 13).
+GROUP_POLL_INTERVAL = 15
 
 
 def emit(type_, **fields):
@@ -812,13 +816,68 @@ def _watch_addresses(nics):
 
 
 # ===========================================================================
-# FIX 5 - do not create sinks for bonded satellites
+# FIX 5  - do not create sinks for bonded satellites
+# FIX 13 - a Sonos group is ONE output
 # ===========================================================================
-_ZGT_TTL = 300          # seconds; re-ask so re-bonding is picked up
-_zgt_cache = {'uuids': frozenset(), 'ts': 0.0, 'ok': False}
-# Every renderer registers at once on startup. Without a lock they all miss the
-# empty cache and fire simultaneous topology requests at one speaker.
-_zgt_lock = None
+# Two kinds of Sonos player must not get a sink of their own, and
+# ZoneGroupTopology is the single place that tells us about both.
+#
+# BONDED (FIX 5). A stereo pair's second speaker, a surround and a Sub belong
+# to another player's zone and are not independently playable. The topology
+# marks them Invisible="1"; satellites are additionally nested as <Satellite>.
+#
+# GROUPED (FIX 13). Rooms grouped in the Sonos app play in lockstep, and only
+# the group's Coordinator owns the transport. Every other member sits at
+# CurrentURI "x-rincon:RINCON_<coordinator>" and follows it. Observed on
+# 2026-09-06 with "Living Room" grouped to "Office" (player ids and addresses
+# below are stand-ins -- a real RINCON id contains the speaker's MAC):
+#
+#   ZoneGroup Coordinator="RINCON_0FF1CE01400"
+#     ZoneGroupMember ZoneName="Office"       UUID="RINCON_0FF1CE01400"
+#     ZoneGroupMember ZoneName="Living Room"  UUID="RINCON_CAFE0101400"
+#
+#   Office       CurrentURI = http://192.0.2.10:8080/audio-content/uuid:...
+#   Living Room  CurrentURI = x-rincon:RINCON_0FF1CE01400
+#
+# yet the sound menu still offered both as separate outputs. Selecting the
+# follower does NOT play to the group: SetAVTransportURI on a grouped member
+# makes it leave the group and play alone, which is the opposite of what
+# someone who grouped the rooms asked for.
+#
+# Fix: register only each group's coordinator, and label its sink with every
+# room in the group ("Living Room + Office"). One sink then drives them all --
+# Sonos relays the stream to the followers itself. Ungroup in the Sonos app
+# and the rooms become separate sinks again; _watch_zone_groups() below
+# notices and rebuilds.
+#
+# The label is sorted alphabetically, NOT coordinator-first: Sonos reassigns
+# the coordinator on its own (when one drops out, or on a regroup), and a name
+# that follows it would rename the user's output device for no visible reason.
+#
+# Volume is not part of this: pa-dlna never issues RenderingControl actions,
+# so each speaker keeps the volume the Sonos app gave it and the group's own
+# volume rules apply.
+
+_ZGT_TTL = 60           # seconds a registration may reuse a cached topology
+_GROUP_SETTLE_POLLS = 2  # consecutive identical polls before acting (FIX 13)
+
+_EMPTY_TOPOLOGY = {'players': {}, 'groups': {}}
+
+# Every renderer registers at once on startup. Without a lock they all miss
+# the empty cache and fire simultaneous topology requests at one speaker.
+# A plain threading lock, not an asyncio one: the FIX 13 watcher thread
+# shares this cache with the registering coroutines.
+_topo_lock = threading.Lock()
+_topo_cache = {'topo': _EMPTY_TOPOLOGY, 'ts': 0.0, 'fresh': False}
+
+# Any Sonos answers for the whole household, so remember the ones we have seen
+# and let the watcher ask whichever is still up.
+_ips_lock = threading.Lock()
+_sonos_ips = []
+
+# Set on the first register(); the watcher uses it to avoid restarting in the
+# middle of playback.
+_control_point = None
 
 _ZGT_BODY = (
     '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
@@ -828,11 +887,15 @@ _ZGT_BODY = (
     '</u:GetZoneGroupState></s:Body></s:Envelope>').encode()
 
 
-def _fetch_invisible_uuids(ip):
-    """UUIDs of Sonos players that are bonded into another zone."""
-    import html
-    import re
+def _fetch_topology(ip):
+    """Read the household's zone topology from one Sonos.
+
+    Returns {'players': {uuid: {'zone', 'coord', 'invisible'}},
+             'groups':  {coordinator uuid: (visible member uuids,)}}
+    with each group's coordinator first in its member tuple.
+    """
     import urllib.request
+    import xml.etree.ElementTree as ET
 
     req = urllib.request.Request(
         f'http://{ip}:1400/ZoneGroupTopology/Control', data=_ZGT_BODY,
@@ -840,76 +903,268 @@ def _fetch_invisible_uuids(ip):
                  'SOAPACTION': '"urn:schemas-upnp-org:service:'
                                'ZoneGroupTopology:1#GetZoneGroupState"'})
     with urllib.request.urlopen(req, timeout=6) as resp:
-        xml = resp.read().decode('utf-8', 'replace')
+        envelope = resp.read()
 
-    # The topology arrives double-escaped inside the SOAP envelope.
-    xml = html.unescape(html.unescape(xml))
+    # The topology is an escaped XML document inside the SOAP response. Let
+    # the parser unescape it exactly once -- unescaping the text by hand
+    # twice, as this did before, mangles a room name containing an '&'.
+    payload = None
+    for elem in ET.fromstring(envelope).iter('ZoneGroupState'):
+        if elem.text and 'ZoneGroup' in elem.text:
+            payload = elem.text
+            break
+    if payload is None:
+        raise ValueError('no ZoneGroupState payload in the SOAP response')
 
-    invisible = set()
-    for tag in re.findall(r'<(?:ZoneGroupMember|Satellite)\b[^>]*/?>', xml):
-        uuid = re.search(r'\bUUID="([^"]+)"', tag)
-        if uuid and re.search(r'\bInvisible="1"', tag):
-            invisible.add(uuid.group(1))
-    return frozenset(invisible)
+    players, groups = {}, {}
+    for group in ET.fromstring(payload).iter('ZoneGroup'):
+        coord = group.get('Coordinator') or ''
+        visible = []
+        for member in group.iter():
+            uuid = member.get('UUID')
+            if not uuid or member.tag not in ('ZoneGroupMember', 'Satellite'):
+                continue
+            invisible = (member.get('Invisible') == '1' or
+                         member.tag == 'Satellite')
+            players[uuid] = {'zone': member.get('ZoneName') or '',
+                             'coord': coord, 'invisible': invisible}
+            if not invisible:
+                visible.append(uuid)
+        if coord:
+            visible.sort(key=lambda uuid: uuid != coord)
+            groups[coord] = tuple(visible)
+    return {'players': players, 'groups': groups}
 
 
-def _cache_fresh(now):
-    return _zgt_cache['ok'] and now - _zgt_cache['ts'] < _ZGT_TTL
+def _topology(ip):
+    """The cached topology, refreshed at most once per _ZGT_TTL.
 
-
-async def _invisible_uuids(ip):
-    global _zgt_lock
-    if _cache_fresh(time.time()):
-        return _zgt_cache['uuids']
-    if _zgt_lock is None:
-        _zgt_lock = asyncio.Lock()
-    async with _zgt_lock:
+    Never raises. If we cannot ask, keep the last good answer -- or, having
+    never had one, an empty topology, which registers every renderer. Failing
+    open shows a speaker that should have been hidden; failing closed would
+    hide one the user actually wanted.
+    """
+    with _topo_lock:
         now = time.time()
-        # Re-check: whoever held the lock before us probably filled it.
-        if _cache_fresh(now):
-            return _zgt_cache['uuids']
+        if _topo_cache['fresh'] and now - _topo_cache['ts'] < _ZGT_TTL:
+            return _topo_cache['topo']
         try:
-            loop = asyncio.get_running_loop()
-            uuids = await loop.run_in_executor(None, _fetch_invisible_uuids, ip)
-            _zgt_cache.update(uuids=uuids, ts=now, ok=True)
-            return uuids
+            topo = _fetch_topology(ip)
         except Exception as e:
-            # Fail open: if we cannot ask, show every renderer rather than
-            # hide a speaker the user actually wanted. Back off for a TTL so
-            # an unreachable speaker is not hammered.
             logger.debug(f'could not read Sonos zone topology from {ip}: '
                          f'{e!r}')
-            _zgt_cache.update(ts=now, ok=True)
-            return _zgt_cache['uuids']
+            # Back off for a TTL so an unreachable speaker is not hammered.
+            _topo_cache['ts'] = now
+            return _topo_cache['topo']
+        _topo_cache.update(topo=topo, ts=now, fresh=True)
+        return topo
+
+
+def _refresh_topology():
+    """Force a refresh, asking each known Sonos until one answers.
+
+    Returns None when none of them did -- which is not a topology change and
+    must never be mistaken for one.
+    """
+    with _ips_lock:
+        ips = list(_sonos_ips)
+    for ip in ips:
+        try:
+            topo = _fetch_topology(ip)
+        except Exception as e:
+            logger.debug(f'zone topology: {ip} did not answer: {e!r}')
+            continue
+        with _topo_lock:
+            _topo_cache.update(topo=topo, ts=time.time(), fresh=True)
+        with _ips_lock:
+            # Ask the speaker that just worked first next time.
+            if ip in _sonos_ips:
+                _sonos_ips.remove(ip)
+                _sonos_ips.insert(0, ip)
+        return topo
+    return None
+
+
+def _remember_sonos_ip(ip):
+    if not ip:
+        return
+    with _ips_lock:
+        if ip not in _sonos_ips:
+            _sonos_ips.append(ip)
+
+
+def _group_rooms(uuid, topo):
+    """Room names in this coordinator's group, alphabetical, deduplicated."""
+    names = set()
+    for member in topo['groups'].get(uuid, ()):
+        zone = topo['players'].get(member, {}).get('zone')
+        if zone:
+            names.add(zone)
+    return sorted(names, key=str.casefold)
+
+
+def _group_label(uuid, topo):
+    """Sink label for a group coordinator, or None when it plays alone."""
+    names = _group_rooms(uuid, topo)
+    if len(names) < 2:
+        return None
+    label = (' + '.join(names) if len(names) <= 3 else
+             f'{names[0]} + {len(names) - 1} more')
+    # The label is interpolated into a quoted pulseaudio module argument.
+    return label.replace('"', '').replace('\\', '')
 
 
 _orig_register = _pa_dlna.AVControlPoint.register
 
 
 async def _register(self, renderer):
+    global _control_point
     _ensure_resume_loop(self)          # FIX 10c, needs the running loop
+    _control_point = self
+
     uuid = _sonos_uuid(renderer)
     if uuid:
+        ip = getattr(renderer.root_device, 'peer_ipaddress', '')
+        _remember_sonos_ip(ip)
         try:
-            if uuid in await _invisible_uuids(renderer.root_device.peer_ipaddress):
-                logger.info(f'skipping {uuid}: bonded into another Sonos zone '
-                            f'(surround, stereo pair partner or Sub), not '
-                            f'independently selectable')
-                return
+            loop = asyncio.get_running_loop()
+            topo = await loop.run_in_executor(None, _topology, ip)
+            player = topo['players'].get(uuid)
+            if player is not None:
+                zone = player['zone'] or uuid
+                if player['invisible']:
+                    logger.info(f'skipping {zone} ({uuid}): bonded into '
+                                f'another Sonos zone (surround, stereo pair '
+                                f'partner or Sub), not independently '
+                                f'selectable')
+                    return
+                coord = player['coord']
+                if coord and coord != uuid:
+                    coord_zone = (topo['players'].get(coord, {}).get('zone')
+                                  or coord)
+                    logger.info(f'skipping {zone} ({uuid}): grouped with '
+                                f'{coord_zone}; the whole group plays through '
+                                f'a single sink')
+                    return
+                label = _group_label(uuid, topo)
+                if label:
+                    # Set before pulse_register(): the null-sink module takes
+                    # device.description from here.
+                    logger.info(f'{zone} coordinates a Sonos group; its sink '
+                                f'plays to all of "{label}"')
+                    renderer.description = label
         except Exception as e:
-            logger.debug(f'bonded-satellite check skipped: {e!r}')
+            logger.debug(f'zone group check skipped: {e!r}')
     result = await _orig_register(self, renderer)
     _mark_started(renderer)
     try:
         if renderer.nullsink is not None:
             emit('zone', uuid=uuid or renderer.upnp_device.UDN,
-                 name=renderer.description, sink=renderer.nullsink.sink.name)
+                 name=renderer.description, sink=renderer.nullsink.sink.name,
+                 rooms=_group_rooms(uuid, _topo_cache['topo']))
     except Exception:
         pass
     return result
 
 
 _pa_dlna.AVControlPoint.register = _register
+
+
+def _grouping_changed(before, after):
+    """True when a player we can still see has been re-grouped or re-bonded.
+
+    Only players present in BOTH snapshots are compared. A speaker dropping
+    off wifi for a poll, or a new one appearing, is pa-dlna's own business
+    (SSDP handles it) and must not cost a restart.
+    """
+    for uuid in before['players'].keys() & after['players'].keys():
+        was, now = before['players'][uuid], after['players'][uuid]
+        if (was['coord'], was['invisible']) != (now['coord'],
+                                                now['invisible']):
+            return True
+    return False
+
+
+def _is_streaming():
+    """True if any renderer is playing -- or if we could not tell."""
+    cp = _control_point
+    if cp is None:
+        return False
+    try:
+        return any(r.stream_sessions.is_playing for r in cp.renderers())
+    except Exception as e:
+        # Iterating the control point's renderers from this thread can race
+        # with the event loop mutating them. Unsure means "do not interrupt".
+        logger.debug(f'could not check for active streams: {e!r}')
+        return True
+
+
+def _watch_zone_groups():
+    """Exit (SIGTERM to self) when the Sonos grouping changes.
+
+    Grouping is only read at discovery, so a group formed or dissolved while
+    we run leaves the sink list wrong: a follower keeps a sink that would tear
+    it out of its group, or an ungrouped room has no sink at all. There is no
+    supported way to add or drop a null-sink for an already-registered
+    renderer, so do what FIX 2 does -- exit and let the shell restart us into
+    a fresh discovery pass.
+    """
+    baseline = None
+    pending = None
+    pending_polls = 0
+    deferred = False
+    while True:
+        time.sleep(GROUP_POLL_INTERVAL)
+        # The whole body is guarded: a watchdog that dies silently on an
+        # unexpected value is worse than no watchdog.
+        try:
+            if baseline is None:
+                # Prefer the snapshot the registrations actually used, so a
+                # regrouping between discovery and this first poll is not
+                # baked into the baseline and missed.
+                with _topo_lock:
+                    if _topo_cache['fresh']:
+                        baseline = _topo_cache['topo']
+                if baseline is None:
+                    baseline = _refresh_topology()
+                continue
+
+            current = _refresh_topology()
+            if current is None:
+                continue
+
+            if not _grouping_changed(baseline, current):
+                pending, pending_polls, deferred = None, 0, False
+                continue
+
+            # Sonos reports transient groupings while a regroup is in
+            # progress; wait for the new one to hold still.
+            if pending is not None and not _grouping_changed(pending, current):
+                pending_polls += 1
+            else:
+                pending, pending_polls = current, 1
+            if pending_polls < _GROUP_SETTLE_POLLS:
+                continue
+
+            if _is_streaming():
+                # Sonos keeps a group in sync with its coordinator, so audio
+                # in flight is unaffected; only the sink list is stale.
+                # Rebuild once playback ends rather than cutting the music.
+                if not deferred:
+                    deferred = True
+                    logger.info('Sonos grouping changed while a stream is '
+                                'running; rebuilding the outputs once '
+                                'playback ends')
+                continue
+
+            logger.warning('Sonos grouping changed; exiting so the shell '
+                           'rebuilds the outputs and each group is offered '
+                           'as one sink.')
+            emit('restart', reason='grouping_changed')
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+        except Exception as e:
+            logger.debug(f'zone group watch skipped a poll: {e!r}')
 
 _orig_close = _pa_dlna.Renderer.close
 
@@ -1486,6 +1741,9 @@ def main(argv=None):
     threading.Thread(target=_watch_addresses,
                      args=(_nics_from_argv(argv),),
                      name='address-watch',
+                     daemon=True).start()
+    threading.Thread(target=_watch_zone_groups,
+                     name='zone-group-watch',
                      daemon=True).start()
     return _pa_dlna.main()
 

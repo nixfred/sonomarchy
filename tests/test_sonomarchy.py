@@ -146,6 +146,30 @@ class Ipv4Enumeration(unittest.TestCase):
 
 
 class TopologyCache(unittest.TestCase):
+    def soap(self, topo):
+        """Wrap a topology the way a real Sonos does: escaped exactly once."""
+        import html
+        return ('<s:Envelope'
+                ' xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+                '<s:Body><u:GetZoneGroupStateResponse'
+                ' xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1">'
+                '<ZoneGroupState>' + html.escape(topo) +
+                '</ZoneGroupState></u:GetZoneGroupStateResponse>'
+                '</s:Body></s:Envelope>').encode()
+
+    def fetch(self, m, topo):
+        class Resp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        import urllib.request
+        original = urllib.request.urlopen
+        payload = self.soap(topo)
+        urllib.request.urlopen = lambda req, timeout=0: Resp(payload)
+        try:
+            return m._fetch_topology('192.0.2.10')
+        finally:
+            urllib.request.urlopen = original
+
     def test_concurrent_registers_fetch_once(self):
         m = load()
         calls = []
@@ -154,45 +178,327 @@ class TopologyCache(unittest.TestCase):
             calls.append(ip)
             import time
             time.sleep(0.05)
-            return frozenset({'RINCON_A'})
-        m._fetch_invisible_uuids = fake_fetch
+            return {'players': {}, 'groups': {}}
+        m._fetch_topology = fake_fetch
 
-        async def herd():
-            return await asyncio.gather(*[m._invisible_uuids('192.0.2.10') for _ in range(11)])
-        results = asyncio.run(herd())
+        results = []
+        threads = [threading.Thread(
+            target=lambda: results.append(m._topology('192.0.2.10')))
+            for _ in range(11)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         self.assertEqual(len(calls), 1)
-        self.assertTrue(all(r == {'RINCON_A'} for r in results))
+        self.assertEqual(len(results), 11)
 
     def test_fetch_failure_fails_open(self):
         m = load()
 
         def boom(ip):
             raise OSError('unreachable')
-        m._fetch_invisible_uuids = boom
-        result = asyncio.run(m._invisible_uuids('192.0.2.10'))
-        self.assertEqual(result, frozenset())
+        m._fetch_topology = boom
+        # Never having had an answer, every renderer must still register.
+        self.assertEqual(m._topology('192.0.2.10'), m._EMPTY_TOPOLOGY)
 
-    def test_invisible_parse(self):
+    def test_fetch_failure_keeps_the_last_good_answer(self):
         m = load()
-        import html
-        topo = ('<ZoneGroups><ZoneGroup Coordinator="RINCON_AAA" ID="x">'
-                '<ZoneGroupMember UUID="RINCON_AAA" ZoneName="Office"/>'
-                '<ZoneGroupMember UUID="RINCON_BBB" ZoneName="Office" Invisible="1"/>'
-                '<ZoneGroupMember UUID="RINCON_CCC" ZoneName="Den"><Satellite UUID="RINCON_DDD" Invisible="1"/></ZoneGroupMember>'
-                '</ZoneGroup></ZoneGroups>')
-        soap = ('<s:Envelope><s:Body><u:GetZoneGroupStateResponse><ZoneGroupState>'
-                + html.escape(html.escape(topo)) + '</ZoneGroupState></u:GetZoneGroupStateResponse></s:Body></s:Envelope>')
+        good = {'players': {'RINCON_A': {'zone': 'Den', 'coord': 'RINCON_A',
+                                         'invisible': False}},
+                'groups': {'RINCON_A': ('RINCON_A',)}}
+        m._fetch_topology = lambda ip: good
+        self.assertEqual(m._topology('192.0.2.10'), good)
+        m._ZGT_TTL = 0                      # force a refresh attempt
+
+        def boom(ip):
+            raise OSError('unreachable')
+        m._fetch_topology = boom
+        self.assertEqual(m._topology('192.0.2.10'), good)
+
+    def test_parses_bonded_and_grouped_players(self):
+        m = load()
+        topo = self.fetch(m, TOPOLOGY_XML)
+        self.assertEqual(topo['players']['RINCON_0FF1CEB0']['invisible'], True)
+        self.assertEqual(topo['players']['RINCON_DECAFB0']['invisible'], True)
+        self.assertEqual(topo['players']['RINCON_CAFE01']['coord'], 'RINCON_0FF1CE')
+        self.assertEqual(topo['players']['RINCON_CAFE01']['zone'], 'Living Room')
+
+    def test_coordinator_is_first_in_its_group(self):
+        m = load()
+        groups = self.fetch(m, TOPOLOGY_XML)['groups']
+        self.assertEqual(groups['RINCON_0FF1CE'], ('RINCON_0FF1CE', 'RINCON_CAFE01'))
+        # Bonded members never appear as playable group members.
+        self.assertNotIn('RINCON_0FF1CEB0', groups['RINCON_0FF1CE'])
+
+    def test_an_ampersand_in_a_room_name_survives(self):
+        # The old parser unescaped the payload twice by hand and turned
+        # "Bed &amp; Bath" into a broken document.
+        m = load()
+        topo = self.fetch(
+            m, '<ZoneGroups><ZoneGroup Coordinator="RINCON_0FF1CE" ID="x">'
+               '<ZoneGroupMember UUID="RINCON_0FF1CE" ZoneName="Bed &amp; Bath"/>'
+               '</ZoneGroup></ZoneGroups>')
+        self.assertEqual(topo['players']['RINCON_0FF1CE']['zone'], 'Bed & Bath')
+
+    def test_a_response_without_a_payload_raises(self):
+        m = load()
+        import urllib.request
 
         class Resp(io.BytesIO):
             def __enter__(self): return self
             def __exit__(self, *a): return False
-        import urllib.request
         original = urllib.request.urlopen
-        urllib.request.urlopen = lambda req, timeout=0: Resp(soap.encode())
+        urllib.request.urlopen = lambda req, timeout=0: Resp(
+            b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+            b'<s:Body/></s:Envelope>')
         try:
-            self.assertEqual(m._fetch_invisible_uuids('192.0.2.10'), frozenset({'RINCON_BBB', 'RINCON_DDD'}))
+            with self.assertRaises(ValueError):
+                m._fetch_topology('192.0.2.10')
         finally:
             urllib.request.urlopen = original
+
+
+# One household, matching the shape of real hardware: Office coordinates a
+# group that Living Room has joined, Office has a bonded surround, and Den has
+# a bonded satellite.
+TOPOLOGY_XML = (
+    '<ZoneGroups>'
+    '<ZoneGroup Coordinator="RINCON_0FF1CE" ID="RINCON_0FF1CE:1">'
+    '<ZoneGroupMember UUID="RINCON_0FF1CE" ZoneName="Office"/>'
+    '<ZoneGroupMember UUID="RINCON_0FF1CEB0" ZoneName="Office" Invisible="1"/>'
+    '<ZoneGroupMember UUID="RINCON_CAFE01" ZoneName="Living Room"/>'
+    '</ZoneGroup>'
+    '<ZoneGroup Coordinator="RINCON_DECAF0" ID="RINCON_DECAF0:1">'
+    '<ZoneGroupMember UUID="RINCON_DECAF0" ZoneName="Den">'
+    '<Satellite UUID="RINCON_DECAFB0" ZoneName="Den"/>'
+    '</ZoneGroupMember>'
+    '</ZoneGroup>'
+    '</ZoneGroups>')
+
+GROUPED = {
+    'players': {
+        'RINCON_0FF1CE': {'zone': 'Office', 'coord': 'RINCON_0FF1CE',
+                       'invisible': False},
+        'RINCON_0FF1CEB0': {'zone': 'Office', 'coord': 'RINCON_0FF1CE',
+                       'invisible': True},
+        'RINCON_CAFE01': {'zone': 'Living Room', 'coord': 'RINCON_0FF1CE',
+                       'invisible': False},
+        'RINCON_DECAF0': {'zone': 'Den', 'coord': 'RINCON_DECAF0',
+                       'invisible': False},
+    },
+    'groups': {'RINCON_0FF1CE': ('RINCON_0FF1CE', 'RINCON_CAFE01'),
+               'RINCON_DECAF0': ('RINCON_DECAF0',)},
+}
+
+
+def ungrouped():
+    """The same household with Living Room pulled out of the Office group."""
+    import copy
+    topo = copy.deepcopy(GROUPED)
+    topo['players']['RINCON_CAFE01']['coord'] = 'RINCON_CAFE01'
+    topo['groups'] = {'RINCON_0FF1CE': ('RINCON_0FF1CE',),
+                      'RINCON_CAFE01': ('RINCON_CAFE01',),
+                      'RINCON_DECAF0': ('RINCON_DECAF0',)}
+    return topo
+
+
+class GroupLabel(unittest.TestCase):
+    def test_a_group_is_named_after_every_room_in_it(self):
+        m = load()
+        self.assertEqual(m._group_label('RINCON_0FF1CE', GROUPED),
+                         'Living Room + Office')
+
+    def test_the_label_is_alphabetical_not_coordinator_first(self):
+        # Sonos reassigns the coordinator on its own; a name that followed it
+        # would rename the user's output device for no visible reason.
+        m = load()
+        self.assertEqual(m._group_label('RINCON_0FF1CE', GROUPED),
+                         m._group_label('RINCON_0FF1CE', GROUPED))
+        flipped = {'players': dict(GROUPED['players']),
+                   'groups': {'RINCON_CAFE01': ('RINCON_CAFE01', 'RINCON_0FF1CE')}}
+        self.assertEqual(m._group_label('RINCON_CAFE01', flipped),
+                         'Living Room + Office')
+
+    def test_a_lone_speaker_gets_no_group_label(self):
+        m = load()
+        self.assertIsNone(m._group_label('RINCON_DECAF0', GROUPED))
+        self.assertIsNone(m._group_label('RINCON_0FF1CE', ungrouped()))
+
+    def test_a_big_group_is_summarised(self):
+        m = load()
+        topo = {'players': {f'u{i}': {'zone': z, 'coord': 'u0',
+                                      'invisible': False}
+                            for i, z in enumerate(['Office', 'Living Room',
+                                                   'Kitchen', 'Patio'])},
+                'groups': {'u0': ('u0', 'u1', 'u2', 'u3')}}
+        self.assertEqual(m._group_label('u0', topo), 'Kitchen + 3 more')
+
+    def test_quotes_cannot_break_the_pulse_module_argument(self):
+        m = load()
+        topo = {'players': {'a': {'zone': 'Office', 'coord': 'a',
+                                  'invisible': False},
+                            'b': {'zone': 'The "Den" \\ Bar', 'coord': 'a',
+                                  'invisible': False}},
+                'groups': {'a': ('a', 'b')}}
+        label = m._group_label('a', topo)
+        self.assertNotIn('"', label)
+        self.assertNotIn('\\', label)
+
+
+class GroupedRegistration(unittest.TestCase):
+    """What the sound menu ends up offering."""
+
+    def outputs(self, m, topo):
+        registered = []
+        m._topo_cache.update(topo=topo, ts=float('inf'), fresh=True)
+        m._ensure_resume_loop = lambda cp: None
+        m._mark_started = lambda r: None
+        m.emit = lambda *a, **k: None
+
+        async def fake_orig(self, renderer):
+            registered.append(renderer.description)
+        m._orig_register = fake_orig
+
+        # A fixed set of renderers: discovery does not depend on what the
+        # topology says, which is the whole point of the empty-topology case.
+        for uuid, player in GROUPED['players'].items():
+            renderer = type('R', (), {})()
+            renderer.upnp_device = type('D', (), {'UDN': f'uuid:{uuid}_MR'})()
+            renderer.root_device = type('RD', (), {
+                'peer_ipaddress': '192.0.2.10'})()
+            renderer.description = f"{player['zone']} (Sonos Play:1)"
+            renderer.nullsink = None
+            asyncio.run(m._register(object(), renderer))
+        return sorted(registered)
+
+    def test_a_group_is_one_output(self):
+        m = load()
+        self.assertEqual(self.outputs(m, GROUPED),
+                         ['Den (Sonos Play:1)', 'Living Room + Office'])
+
+    def test_ungrouping_gives_each_room_its_own_output_again(self):
+        m = load()
+        self.assertEqual(
+            self.outputs(m, ungrouped()),
+            ['Den (Sonos Play:1)', 'Living Room (Sonos Play:1)',
+             'Office (Sonos Play:1)'])
+
+    def test_an_unknown_topology_registers_everything(self):
+        # Fail open: better a speaker that should have been hidden than a
+        # missing one.
+        m = load()
+        self.assertEqual(len(self.outputs(m, m._EMPTY_TOPOLOGY)), 4)
+
+
+class GroupingChange(unittest.TestCase):
+    def test_regrouping_is_a_change(self):
+        m = load()
+        self.assertTrue(m._grouping_changed(GROUPED, ungrouped()))
+
+    def test_an_identical_topology_is_not(self):
+        m = load()
+        self.assertFalse(m._grouping_changed(GROUPED, GROUPED))
+
+    def test_a_speaker_dropping_off_wifi_is_not_a_regrouping(self):
+        m = load()
+        gone = {'players': {u: p for u, p in GROUPED['players'].items()
+                            if u != 'RINCON_CAFE01'},
+                'groups': GROUPED['groups']}
+        self.assertFalse(m._grouping_changed(GROUPED, gone))
+
+    def test_a_new_speaker_is_not_a_regrouping(self):
+        m = load()
+        added = {'players': dict(GROUPED['players'],
+                                 RINCON_NEW={'zone': 'Deck',
+                                             'coord': 'RINCON_NEW',
+                                             'invisible': False}),
+                 'groups': GROUPED['groups']}
+        self.assertFalse(m._grouping_changed(GROUPED, added))
+
+    def test_re_bonding_into_a_stereo_pair_is_a_change(self):
+        m = load()
+        bonded = {'players': dict(GROUPED['players'],
+                                  RINCON_CAFE01={'zone': 'Living Room',
+                                              'coord': 'RINCON_0FF1CE',
+                                              'invisible': True}),
+                  'groups': GROUPED['groups']}
+        self.assertTrue(m._grouping_changed(GROUPED, bonded))
+
+
+class GroupWatch(unittest.TestCase):
+    """The watchdog that rebuilds the sinks when the grouping changes."""
+
+    def run_watch(self, m, polls, playing=False, stop_playing_after=None):
+        """Drive _watch_zone_groups over scripted _refresh_topology results."""
+        exits, emitted, ticks = [], [], [0]
+
+        class Stop(BaseException):
+            """Not an Exception: the watchdog's guard must not swallow it."""
+
+        def sleep(_):
+            ticks[0] += 1
+            if stop_playing_after is not None and ticks[0] > stop_playing_after:
+                session.is_playing = False
+
+        readings = iter(polls)
+
+        def refresh():
+            try:
+                return next(readings)
+            except StopIteration:
+                raise Stop
+
+        session = type('S', (), {'is_playing': playing})()
+        renderer = type('R', (), {'stream_sessions': session})()
+        m.time = type('T', (), {'sleep': staticmethod(sleep),
+                                'time': staticmethod(lambda: 0.0)})()
+        m.os = type('O', (), {'kill': staticmethod(
+            lambda *a: exits.append(a)),
+            'getpid': staticmethod(lambda: 4242)})()
+        m._refresh_topology = refresh
+        m.emit = lambda type_, **kw: emitted.append(type_)
+        m._topo_cache.update(topo=GROUPED, ts=0.0, fresh=True)
+        m._control_point = type('CP', (), {
+            'renderers': staticmethod(lambda: [renderer])})()
+        try:
+            m._watch_zone_groups()
+        except Stop:
+            pass
+        return bool(exits), emitted
+
+    def test_a_steady_household_is_left_alone(self):
+        m = load()
+        self.assertEqual(self.run_watch(m, [GROUPED] * 6)[0], False)
+
+    def test_a_settled_change_rebuilds_the_outputs(self):
+        m = load()
+        exited, emitted = self.run_watch(m, [ungrouped()] * 3)
+        self.assertTrue(exited)
+        self.assertIn('restart', emitted)
+
+    def test_one_poll_is_not_enough(self):
+        # Sonos reports transient groupings while a regroup is in progress.
+        m = load()
+        self.assertEqual(self.run_watch(m, [ungrouped()])[0], False)
+
+    def test_a_reading_that_reverts_is_ignored(self):
+        m = load()
+        self.assertEqual(
+            self.run_watch(m, [ungrouped(), GROUPED, GROUPED])[0], False)
+
+    def test_unreachable_speakers_are_not_a_change(self):
+        m = load()
+        self.assertEqual(self.run_watch(m, [None] * 6)[0], False)
+
+    def test_the_rebuild_waits_for_playback_to_end(self):
+        m = load()
+        self.assertEqual(
+            self.run_watch(m, [ungrouped()] * 6, playing=True)[0], False)
+
+    def test_and_happens_once_playback_ends(self):
+        m = load()
+        self.assertTrue(self.run_watch(m, [ungrouped()] * 8, playing=True,
+                                       stop_playing_after=4)[0])
 
 
 class Emit(unittest.TestCase):
