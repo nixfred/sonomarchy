@@ -54,15 +54,21 @@ ufw allow proto udp from 192.168.1.0/24 to any port 8081 comment 'Sonomarchy dis
 
 The plugin itself never touches the firewall or asks for elevated rights;
 these rules are yours to add once. It does work out the exact command for
-you: if a firewall service is running, the backend logs the rule for **your**
-subnet and **your** ports at startup, so you can copy it rather than adapt
-the example above —
+you: if a firewall service is running, the rule for **your** subnet and
+**your** ports is written to the shell journal at startup, so you can copy it
+rather than adapt the example above —
 
 ```
-ufw is running. If a zone is selectable but silent, the speakers need to
-reach this machine on 10.0.0.0/24: ufw allow proto tcp from 10.0.0.0/24 to
-any port 8080 comment 'Sonomarchy stream' && ufw allow proto udp from
-10.0.0.0/24 to any port 8081 comment 'Sonomarchy discovery'
+Sonomarchy: ufw is running; if a zone is selectable but silent the speakers
+must reach 10.0.0.0/24 — ufw allow proto tcp from 10.0.0.0/24 to any port
+8080 comment 'Sonomarchy stream' && ufw allow proto udp from 10.0.0.0/24 to
+any port 8081 comment 'Sonomarchy discovery'
+```
+
+Find it with:
+
+```bash
+journalctl --user -b | grep Sonomarchy | grep 'is running'
 ```
 
 `firewalld` gets `firewall-cmd` syntax. Note what this does *not* claim:

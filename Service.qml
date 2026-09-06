@@ -31,6 +31,8 @@ Item {
   property bool expectedStop: false
   property bool healthyThisRun: false
   property bool firewallWarned: false
+  property var firewallRules: []
+  property bool firewallRulesLogged: false
   property string restartReason: ""
 
   readonly property int zoneCount: Object.keys(zones).length
@@ -65,6 +67,7 @@ Item {
     lastError = ""
     restartAttempt = 0
     firewallWarned = false
+    firewallRulesLogged = false
     if (backend.running) {
       // The backend stops cleanly on SIGTERM and onExited brings it back.
       restartReason = "ipc"
@@ -132,6 +135,22 @@ Item {
         }
         break
       }
+      case "firewall_rules":
+        // The backend logs this at INFO, and the stderr forwarder below only
+        // passes WARNING/ERROR through — so without this case the hint never
+        // reaches the journal at all. It is not a fault and must not become a
+        // warning: console.log puts it in the journal for anyone who goes
+        // looking, while the loud path stays with firewall_suspected, which
+        // fires only after a speaker has really failed to fetch.
+        firewallRules = message.rules || []
+        if (!firewallRulesLogged) {
+          firewallRulesLogged = true
+          console.log("Sonomarchy: " + plainText(String(message.firewall), 16)
+            + " is running; if a zone is selectable but silent the speakers must reach "
+            + plainText(String(message.subnet), 24) + " — "
+            + plainText(firewallRules.join(" && "), 400))
+        }
+        break
       case "restart":
         restartReason = plainText(message.reason, 64)
         state = "restarting"

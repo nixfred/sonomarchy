@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.5 — 2026-09-05
+
+- Fixed: 0.1.4's startup firewall hint never appeared. It was logged at INFO,
+  and the stderr forwarder in `Service.qml` passes only WARNING and ERROR to
+  the shell journal, so the one line meant to save people an hour was dropped
+  before anyone could read it. The backend now also emits it as a structured
+  event and the shell logs it once per backend. It stays out of WARNING on
+  purpose: a running firewall is not a fault, and a warning that is not a
+  fault teaches people to ignore warnings.
+- Fixed: the README claimed the hint was "logged at startup" without saying
+  where to find it. It now shows the line and the `journalctl` incantation.
+
 ## 0.1.4 — 2026-09-05
 
 The firewall advice was correct and useless in the same breath: it named two
