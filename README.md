@@ -139,9 +139,15 @@ the plugin will say so rather than fail silently.
   rooms leave the output list on purpose: playing to one member of a group
   pulls it *out* of the group and plays it alone, which is never what you
   meant by grouping them. Group or ungroup while Sonomarchy is running and
-  the outputs rebuild within about half a minute; the zones disappear
-  briefly, as they do on a network change. A rebuild waits for playback to
-  end, so it will not cut your music short.
+  the outputs rebuild; the zones disappear briefly, as they do on a network
+  change. A rebuild waits for playback to end, so it will not cut your music
+  short. Sonomarchy subscribes to the speakers' topology events, so this is
+  normally immediate — but the speaker has to reach this machine to deliver
+  one, and a default-deny firewall drops it silently. If yours does, the
+  rebuild falls back to a 15-second poll, which is correct but slower; the
+  startup log prints the exact rule to open that port, and
+  `SONOMARCHY_EVENT_PORT` pins it if you would rather the rule not chase a
+  port number.
 - **Changing networks** (dock/undock, wifi↔ethernet) restarts the backend
   automatically. Zones disappear for a few seconds and come back with correct
   stream addresses.

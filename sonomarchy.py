@@ -106,18 +106,21 @@ user which port to open.
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import os
 import signal
+import socketserver
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 
-VERSION = '0.1.7'
+VERSION = '0.1.8'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -1114,7 +1117,9 @@ def _watch_zone_groups():
     pending_polls = 0
     deferred = False
     while True:
-        time.sleep(GROUP_POLL_INTERVAL)
+        # Returns as soon as a Sonos tells us the household changed (FIX 14),
+        # or after GROUP_POLL_INTERVAL if nothing does.
+        _wait_for_group_change()
         # The whole body is guarded: a watchdog that dies silently on an
         # unexpected value is worse than no watchdog.
         try:
@@ -1165,6 +1170,273 @@ def _watch_zone_groups():
             return
         except Exception as e:
             logger.debug(f'zone group watch skipped a poll: {e!r}')
+
+
+# ===========================================================================
+# FIX 14 - notice a regroup the moment it happens
+# ===========================================================================
+# FIX 13's watchdog polls the topology every GROUP_POLL_INTERVAL seconds, so a
+# regroup can take half a minute to show up in the sound menu. Sonos will tell
+# us instead: ZoneGroupTopology is an evented UPnP service, so SUBSCRIBE to it
+# and the speaker POSTs a NOTIFY the instant the household changes.
+#
+# The NOTIFY body is deliberately ignored. It carries the new topology in yet
+# another encoding, and trusting it would mean a second parser and an
+# assumption that events arrive in order. All we take from it is "something
+# changed"; the watchdog then re-reads the topology over SOAP as it always
+# did, which is authoritative and already tested.
+#
+# Eventing is a fast path, never a dependency. The speaker connects back to
+# us, so a firewall that drops the callback port makes NOTIFY silently
+# disappear -- the same failure FIX 8 exists for on the audio port. The poll
+# is therefore kept exactly as it was: if events never arrive, the worst case
+# is the behaviour of 0.1.7. Nothing here can make grouping detection worse
+# than not having it.
+#
+# The callback port is taken from a range above the audio one (the backend
+# hands pa-dlna something in 8080-8089), chosen at startup and logged, so a
+# firewall rule can name it.
+
+GROUP_EVENT_PORTS = range(8090, 8100)
+
+# Seconds to let a regroup finish after an event wakes us. Sonos emits
+# several NOTIFYs while rooms are moving between groups; without this the
+# settle rule in FIX 13 would be satisfied by two readings microseconds apart
+# and could act on a half-finished regroup.
+GROUP_EVENT_SETTLE = 3
+
+# Seconds of subscription lease to ask for, and the fraction of it at which
+# we renew.
+GROUP_EVENT_LEASE = 1800
+
+# Seconds between checks that the subscription is still alive.
+GROUP_EVENT_POLL = 30
+
+_ZGT_EVENT_PATH = '/ZoneGroupTopology/Event'
+
+_group_wakeup = threading.Event()
+_event_state = {'port': None, 'sid': None, 'ip': None, 'renew_at': 0.0,
+                'notifies': 0, 'warned': False, 'server': None}
+
+
+class _ZgtEventServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind() resolves the bind address with
+        # socket.getfqdn(), a reverse DNS lookup that blocks for a full
+        # resolver timeout -- measured at 5.0 s here -- because nothing
+        # answers for 0.0.0.0. server_name is only ever used to fill in CGI
+        # variables, which this server does not have, so skip the lookup.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class _ZgtEventHandler(BaseHTTPRequestHandler):
+    """Answers the NOTIFY a Sonos sends when the household changes."""
+
+    protocol_version = 'HTTP/1.1'
+
+    def do_NOTIFY(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            if length:
+                self.rfile.read(length)     # drained, then discarded on purpose
+            self.send_response(200)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        except Exception as e:
+            logger.debug(f'malformed zone topology NOTIFY: {e!r}')
+            return
+        _event_state['notifies'] += 1
+        _group_wakeup.set()
+
+    def log_message(self, *args):
+        pass            # BaseHTTPRequestHandler logs every request to stderr
+
+
+def _start_event_listener(nics=None):
+    """Listen for topology NOTIFYs. Returns the port, or None if we cannot."""
+    override = os.environ.get('SONOMARCHY_EVENT_PORT')
+    ports = [int(override)] if (override or '').isdigit() else GROUP_EVENT_PORTS
+    for port in ports:
+        try:
+            server = _ZgtEventServer(('0.0.0.0', port), _ZgtEventHandler)
+        except OSError as e:
+            logger.debug(f'zone topology event port {port} unusable: {e!r}')
+            continue
+        threading.Thread(target=server.serve_forever, name='zgt-events',
+                         daemon=True).start()
+        _event_state.update(port=port, server=server)
+        rule = _event_port_rule(nics, port)
+        logger.info(
+            f'listening for Sonos zone topology events on port {port}. A '
+            f'firewall that blocks it costs speed, not correctness: the '
+            f'{GROUP_POLL_INTERVAL}s poll still catches every regroup.'
+            + (f' To make regrouping instant: {rule}' if rule else ''))
+        return port
+    logger.info(f'no free port for Sonos topology events in '
+                f'{ports[0]}-{ports[-1]}; falling back to the '
+                f'{GROUP_POLL_INTERVAL}s poll')
+    return None
+
+
+def _event_port_rule(nics, port):
+    """The firewall rule that makes the callback reachable, or '' if unsure.
+
+    Same reasoning as FIX 11: a hint we cannot render exactly is worse than
+    no hint, so anything uncertain returns nothing.
+    """
+    try:
+        addresses = sorted(_current_ipv4(nics))
+        cidr = _lan_cidr(addresses[0]) if addresses else None
+        if not cidr:
+            return ''
+        if _active_firewall() == 'firewalld':
+            return (f"firewall-cmd --permanent --add-rich-rule='rule"
+                    f" family=ipv4 source address={cidr} port port={port}"
+                    f" protocol=tcp accept' && firewall-cmd --reload")
+        return (f'ufw allow proto tcp from {cidr} to any port {port}'
+                f" comment 'Sonomarchy zone events'")
+    except Exception as e:
+        logger.debug(f'event port rule hint skipped: {e!r}')
+        return ''
+
+
+def _event_request(ip, method, headers):
+    import urllib.request
+    req = urllib.request.Request(f'http://{ip}:1400{_ZGT_EVENT_PATH}',
+                                 method=method)
+    for key, value in headers.items():
+        req.add_header(key, value)
+    with urllib.request.urlopen(req, timeout=6) as resp:
+        return dict(resp.headers)
+
+
+def _lease_seconds(header):
+    """'Second-1800' -> 1800. Anything else -> the lease we asked for."""
+    try:
+        return max(60, int((header or '').split('-', 1)[1]))
+    except Exception:
+        return GROUP_EVENT_LEASE
+
+
+def _local_ip_for(peer):
+    """The address a packet to `peer` would leave from."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((peer, 1400))      # UDP connect: sets a route, sends none
+        return sock.getsockname()[0]
+
+
+def _subscribe(ip, port):
+    callback = f'http://{_local_ip_for(ip)}:{port}{_ZGT_EVENT_PATH}'
+    headers = _event_request(ip, 'SUBSCRIBE', {
+        'CALLBACK': f'<{callback}>',
+        'NT': 'upnp:event',
+        'TIMEOUT': f'Second-{GROUP_EVENT_LEASE}'})
+    sid = headers.get('SID')
+    if not sid:
+        raise ValueError('SUBSCRIBE returned no SID')
+    lease = _lease_seconds(headers.get('TIMEOUT'))
+    _event_state.update(sid=sid, ip=ip, renew_at=time.time() + lease / 2)
+    logger.info(f'subscribed to zone topology events on {ip} '
+                f'(lease {lease}s); regroups now show up at once')
+    return sid
+
+
+def _renew():
+    ip, sid = _event_state['ip'], _event_state['sid']
+    headers = _event_request(ip, 'SUBSCRIBE', {'SID': sid,
+                                               'TIMEOUT': f'Second-'
+                                                          f'{GROUP_EVENT_LEASE}'})
+    lease = _lease_seconds(headers.get('TIMEOUT'))
+    _event_state['renew_at'] = time.time() + lease / 2
+    logger.debug(f'renewed zone topology subscription on {ip} ({lease}s)')
+
+
+def _unsubscribe():
+    ip, sid = _event_state['ip'], _event_state['sid']
+    if not (ip and sid):
+        return
+    try:
+        _event_request(ip, 'UNSUBSCRIBE', {'SID': sid})
+        logger.debug(f'unsubscribed from zone topology events on {ip}')
+    except Exception as e:
+        # The lease expires on its own; a speaker POSTing to a closed port
+        # gets a refused connection and drops us.
+        logger.debug(f'unsubscribe failed, letting the lease lapse: {e!r}')
+    finally:
+        _event_state.update(sid=None, ip=None, renew_at=0.0)
+
+
+def _watch_zone_group_events(nics=None):
+    """Keep one live topology subscription, on whichever speaker answers.
+
+    Never raises: every failure degrades to FIX 13's poll.
+    """
+    port = _start_event_listener(nics)
+    if port is None:
+        return
+    atexit.register(_unsubscribe)
+    while True:
+        time.sleep(GROUP_EVENT_POLL)
+        try:
+            if _event_state['sid'] is not None:
+                if time.time() < _event_state['renew_at']:
+                    _warn_once_if_events_are_not_arriving()
+                    continue
+                try:
+                    _renew()
+                    continue
+                except Exception as e:
+                    logger.info(f'zone topology subscription lost '
+                                f'({e!r}); resubscribing')
+                    _event_state.update(sid=None, ip=None, renew_at=0.0)
+
+            with _ips_lock:
+                candidates = list(_sonos_ips)
+            for ip in candidates:
+                try:
+                    _subscribe(ip, port)
+                    break
+                except Exception as e:
+                    logger.debug(f'could not subscribe on {ip}: {e!r}')
+        except Exception as e:
+            logger.debug(f'zone topology event watch skipped a turn: {e!r}')
+
+
+def _warn_once_if_events_are_not_arriving():
+    """Say so, once, if a live subscription has never produced a NOTIFY.
+
+    A silent subscription means the speaker cannot reach our callback port --
+    almost always a firewall. Worth one line, because the symptom otherwise is
+    just "grouping takes a while to show up".
+    """
+    if _event_state['warned'] or _event_state['notifies']:
+        return
+    if time.time() < _event_state['renew_at'] - GROUP_EVENT_LEASE / 4:
+        return
+    _event_state['warned'] = True
+    logger.info(f'subscribed to zone topology events on '
+                f'{_event_state["ip"]} but none have arrived; the speaker '
+                f'may be unable to reach port {_event_state["port"]} on this '
+                f'machine. Regroups are still picked up by the '
+                f'{GROUP_POLL_INTERVAL}s poll.')
+
+
+def _wait_for_group_change():
+    """Block until a topology event arrives, or the poll interval elapses.
+
+    Returns True when an event woke us. The extra settle pause is what keeps
+    FIX 13's "hold for two readings" rule meaningful: without it a burst of
+    NOTIFYs mid-regroup would satisfy it in microseconds.
+    """
+    woken = _group_wakeup.wait(GROUP_POLL_INTERVAL)
+    if woken:
+        _group_wakeup.clear()
+        time.sleep(GROUP_EVENT_SETTLE)
+    return woken
 
 _orig_close = _pa_dlna.Renderer.close
 
@@ -1744,6 +2016,10 @@ def main(argv=None):
                      daemon=True).start()
     threading.Thread(target=_watch_zone_groups,
                      name='zone-group-watch',
+                     daemon=True).start()
+    threading.Thread(target=_watch_zone_group_events,
+                     args=(_nics_from_argv(argv),),
+                     name='zone-group-events',
                      daemon=True).start()
     return _pa_dlna.main()
 

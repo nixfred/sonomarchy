@@ -15,6 +15,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -435,10 +436,13 @@ class GroupWatch(unittest.TestCase):
         class Stop(BaseException):
             """Not an Exception: the watchdog's guard must not swallow it."""
 
-        def sleep(_):
+        def wait_for_change():
+            # Stands in for _wait_for_group_change, which blocks on a real
+            # threading.Event fed by Sonos NOTIFYs (FIX 14).
             ticks[0] += 1
             if stop_playing_after is not None and ticks[0] > stop_playing_after:
                 session.is_playing = False
+            return False
 
         readings = iter(polls)
 
@@ -450,8 +454,7 @@ class GroupWatch(unittest.TestCase):
 
         session = type('S', (), {'is_playing': playing})()
         renderer = type('R', (), {'stream_sessions': session})()
-        m.time = type('T', (), {'sleep': staticmethod(sleep),
-                                'time': staticmethod(lambda: 0.0)})()
+        m._wait_for_group_change = wait_for_change
         m.os = type('O', (), {'kill': staticmethod(
             lambda *a: exits.append(a)),
             'getpid': staticmethod(lambda: 4242)})()
@@ -1120,6 +1123,114 @@ class TransientSinkInput(unittest.TestCase):
         r = self.make(m, closed, inputs=[(8211, 42)], pointer_index=8211)
         asyncio.run(m._maybe_stop(r, 10570, 'PLAYING'))
         self.assertEqual(closed, ['ignored'])
+
+
+class TopologyEvents(unittest.TestCase):
+    """FIX 14: a Sonos NOTIFY wakes the watchdog immediately."""
+
+    def test_lease_is_parsed_from_the_timeout_header(self):
+        m = load()
+        self.assertEqual(m._lease_seconds('Second-1800'), 1800)
+        self.assertEqual(m._lease_seconds('Second-300'), 300)
+
+    def test_a_nonsense_lease_falls_back_to_what_we_asked_for(self):
+        m = load()
+        for bad in ('infinite', '', None, 'Second-', 'Second-nope'):
+            self.assertEqual(m._lease_seconds(bad), m.GROUP_EVENT_LEASE)
+
+    def test_an_absurdly_short_lease_is_floored(self):
+        # Renewing at half of a 1-second lease would hammer the speaker.
+        m = load()
+        self.assertEqual(m._lease_seconds('Second-1'), 60)
+
+    def test_subscribe_sends_a_callback_the_speaker_can_reach(self):
+        m = load()
+        sent = {}
+
+        def fake_request(ip, method, headers):
+            sent.update(ip=ip, method=method, headers=headers)
+            return {'SID': 'uuid:abc', 'TIMEOUT': 'Second-600'}
+        m._event_request = fake_request
+        m._local_ip_for = lambda peer: '192.0.2.99'
+
+        m._subscribe('192.0.2.10', 8090)
+        self.assertEqual(sent['method'], 'SUBSCRIBE')
+        self.assertEqual(sent['headers']['CALLBACK'],
+                         '<http://192.0.2.99:8090/ZoneGroupTopology/Event>')
+        self.assertEqual(sent['headers']['NT'], 'upnp:event')
+        self.assertEqual(m._event_state['sid'], 'uuid:abc')
+        self.assertEqual(m._event_state['ip'], '192.0.2.10')
+
+    def test_a_subscribe_without_a_sid_is_an_error(self):
+        m = load()
+        m._event_request = lambda ip, method, headers: {'TIMEOUT': 'Second-600'}
+        m._local_ip_for = lambda peer: '192.0.2.99'
+        with self.assertRaises(ValueError):
+            m._subscribe('192.0.2.10', 8090)
+
+    def test_unsubscribe_clears_state_even_when_it_fails(self):
+        m = load()
+        m._event_state.update(sid='uuid:abc', ip='192.0.2.10')
+
+        def boom(ip, method, headers):
+            raise OSError('speaker gone')
+        m._event_request = boom
+        m._unsubscribe()                       # must not raise
+        self.assertIsNone(m._event_state['sid'])
+        self.assertIsNone(m._event_state['ip'])
+
+    def test_unsubscribe_on_a_dead_subscription_does_nothing(self):
+        m = load()
+        called = []
+        m._event_request = lambda *a, **k: called.append(a)
+        m._unsubscribe()
+        self.assertEqual(called, [])
+
+    def test_an_event_wakes_the_watchdog_at_once(self):
+        m = load()
+        m.GROUP_POLL_INTERVAL = 30      # long enough that a poll cannot explain it
+        m.GROUP_EVENT_SETTLE = 0
+        m._group_wakeup.set()
+        started = time.monotonic()
+        self.assertTrue(m._wait_for_group_change())
+        self.assertLess(time.monotonic() - started, 1)
+        # The flag must be consumed, or the next turn spins.
+        self.assertFalse(m._group_wakeup.is_set())
+
+    def test_without_an_event_it_falls_back_to_the_poll_interval(self):
+        m = load()
+        m.GROUP_POLL_INTERVAL = 0.05
+        started = time.monotonic()
+        self.assertFalse(m._wait_for_group_change())
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+
+    def test_a_notify_over_the_wire_sets_the_wakeup(self):
+        # The one test that opens a socket, on loopback only: the handler is
+        # reached by an HTTP method (NOTIFY) that no client library sends by
+        # default, so faking the request would prove nothing.
+        import urllib.request
+        m = load()
+        port = m._start_event_listener()
+        self.assertIsNotNone(port, 'no free port in the event range')
+        try:
+            m._group_wakeup.clear()
+            req = urllib.request.Request(
+                f'http://127.0.0.1:{port}/ZoneGroupTopology/Event',
+                data=b'<propertyset/>', method='NOTIFY')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+            self.assertTrue(m._group_wakeup.wait(2))
+            self.assertEqual(m._event_state['notifies'], 1)
+        finally:
+            m._group_wakeup.clear()
+            m._event_state['server'].shutdown()
+            m._event_state['server'].server_close()
+
+    def test_the_listener_reports_failure_rather_than_raising(self):
+        m = load()
+        m.GROUP_EVENT_PORTS = range(1, 2)      # port 1: not ours to bind
+        self.assertIsNone(m._start_event_listener())
+        self.assertIsNone(m._event_state['server'])
 
 
 if __name__ == '__main__':

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.8 — 2026-09-07
+
+Regrouping shows up at once instead of within half a minute — where the
+network lets it.
+
+- Added: Sonomarchy subscribes to ZoneGroupTopology events, so a Sonos tells
+  us the moment rooms are grouped or ungrouped rather than waiting to be
+  asked. The NOTIFY body is ignored on purpose: it only wakes the watchdog,
+  which then re-reads the topology over SOAP exactly as before, so there is
+  no second parser and no dependence on event ordering.
+- **Eventing is a fast path, never a dependency.** The speaker connects back
+  to this machine, so a default-deny firewall drops the callback and events
+  silently never arrive — measured on the development machine, where ufw
+  allowed only the audio and discovery ports. The 15 s poll from 0.1.7 is
+  therefore untouched and still catches every regroup; the worst case is
+  exactly 0.1.7's behaviour. The startup log now names the port and prints
+  the precise `ufw`/`firewalld` rule that makes regrouping instant, and a
+  subscription that has produced no events after several minutes says so
+  once rather than leaving you to wonder.
+- Fixed: `HTTPServer.server_bind()` resolves its bind address with
+  `socket.getfqdn()`, a reverse DNS lookup with nothing to answer it for
+  0.0.0.0. It blocked the event listener's startup for a full resolver
+  timeout, measured at 5.0 s. Skipped; startup is now instant.
+
 ## 0.1.7 — 2026-09-06
 
 Grouped rooms are one output now, instead of one broken sink per room.
