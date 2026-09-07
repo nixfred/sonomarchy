@@ -577,68 +577,190 @@ class Emit(unittest.TestCase):
         self.assertEqual(json.loads(line), {'type': 'zone', 'uuid': 'RINCON_A', 'name': 'Office (Sonos Playbar)'})
 
 
-class StaleSinkCleanup(unittest.TestCase):
-    # `pactl list short modules` is tab-separated: index, name, argument.
+class SinkAdoption(unittest.TestCase):
+    """FIX 15: a restart must not move the user's audio."""
+
     MODULES = '\n'.join([
-        '5\tmodule-alsa-card\tdevice_id=0',
-        '536870916\tmodule-null-sink\tsink_name="Sonos Play:1-uuid:RINCON_000E58A0B1C201400_MR" sink_properties=device.description="Den (Sonos Play:1)"',
-        '536870917\tmodule-null-sink\tsink_name="easyeffects_sink"',
+        '536870916\tmodule-null-sink\tsink_name="Sonos Play:1-uuid:RINCON_000E58A0B1C201400_MR" sink_properties=device.description="Den"',
+        '536870917\tmodule-null-sink\tsink_name="Loopback"',
         '536870918\tmodule-null-sink\tsink_name="Sonos Playbar-uuid:RINCON_000E58A0B1C301400_MR"',
-        '536870919\tmodule-null-sink',
+        '536870919\tmodule-alsa-card\tdevice_id="0"',
     ])
-    CLIENTS_WITH_PA_DLNA = 'Client #80839\n\tDriver: PipeWire\n\tProperties:\n\t\tapplication.name = "pa-dlna"\n'
-    CLIENTS_WITHOUT = 'Client #12\n\tProperties:\n\t\tapplication.name = "Firefox"\n'
 
-    def fake_pactl(self, clients_text, calls):
-        class FakeRun:
-            def __init__(self, stdout): self.stdout = stdout
+    def sink(self, name, description=None, owner_module=7):
+        proplist = {} if description is None else {
+            'device.description': description}
+        return type('S', (), {'name': name, 'owner_module': owner_module,
+                              'proplist': proplist})()
 
-        def fake_run(cmd, **kw):
+    def renderer(self, model, udn, description):
+        r = type('R', (), {})()
+        r.upnp_device = type('D', (), {'UDN': udn, 'modelName': model})()
+        r.getattr = lambda n, _m=model: _m
+        r.description = description
+        return r
+
+    def pulse(self, m, sinks, closing=False):
+        unloaded = []
+
+        class LibPulse:
+            async def pa_context_get_sink_info_list(self):
+                return sinks
+
+            async def pa_context_unload_module(self, index):
+                unloaded.append(index)
+        p = type('P', (), {})()
+        p.lib_pulse = LibPulse()
+        p.av_control_point = type('C', (), {'closing': closing})()
+        return p, unloaded
+
+    # --- naming and description -------------------------------------------
+    def test_sink_name_matches_what_pa_dlna_uses(self):
+        m = load()
+        r = self.renderer('Sonos Play:1', 'uuid:RINCON_A_MR', 'Den')
+        self.assertEqual(m._null_sink_name(r),
+                         'Sonos Play:1-uuid:RINCON_A_MR')
+
+    def test_description_of_a_sink_without_a_proplist(self):
+        m = load()
+        self.assertEqual(m._sink_description(self.sink('x')), '')
+        self.assertEqual(m._sink_description(object()), '')
+
+    # --- adopting ----------------------------------------------------------
+    def test_a_matching_sink_is_adopted_not_reloaded(self):
+        # The whole point: the sink never disappears, so PipeWire has no
+        # reason to move a stream off it.
+        m = load()
+        r = self.renderer('Sonos Play:1', 'uuid:RINCON_A_MR', 'Den')
+        existing = self.sink('Sonos Play:1-uuid:RINCON_A_MR', 'Den')
+        p, unloaded = self.pulse(m, [existing])
+        m._orig_pulse_register = lambda *a: self.fail('loaded a second sink')
+        nullsink = asyncio.run(m._pulse_register(p, r))
+        self.assertIs(nullsink.sink, existing)
+        self.assertEqual(unloaded, [])
+        self.assertIn('Sonos Play:1-uuid:RINCON_A_MR', m._adopted_sinks)
+
+    def test_a_relabelled_sink_is_reloaded(self):
+        # A regroup (FIX 13) renames the output. The sound menu has to change,
+        # so moving the stream is correct here.
+        m = load()
+        r = self.renderer('Sonos Playbar', 'uuid:RINCON_B_MR',
+                          'Living Room + Office')
+        existing = self.sink('Sonos Playbar-uuid:RINCON_B_MR',
+                             'Office (Sonos Playbar)', owner_module=42)
+        p, unloaded = self.pulse(m, [existing])
+        loaded = []
+
+        async def fresh(pulse, renderer):
+            loaded.append(renderer.description)
+            return m._pulseaudio.NullSink(self.sink(
+                'Sonos Playbar-uuid:RINCON_B_MR', renderer.description))
+        m._orig_pulse_register = fresh
+        asyncio.run(m._pulse_register(p, r))
+        self.assertEqual(unloaded, [42])
+        self.assertEqual(loaded, ['Living Room + Office'])
+
+    def test_no_existing_sink_falls_through_to_upstream(self):
+        m = load()
+        r = self.renderer('Sonos Play:1', 'uuid:RINCON_NEW_MR', 'Patio')
+        p, unloaded = self.pulse(m, [self.sink('something else')])
+        called = []
+
+        async def fresh(pulse, renderer):
+            called.append(renderer.description)
+            return None
+        m._orig_pulse_register = fresh
+        self.assertIsNone(asyncio.run(m._pulse_register(p, r)))
+        self.assertEqual(called, ['Patio'])
+        self.assertEqual(unloaded, [])
+
+    def test_a_broken_sink_list_still_registers(self):
+        # Fail back to upstream rather than leaving the user with no output.
+        m = load()
+        r = self.renderer('Sonos Play:1', 'uuid:RINCON_A_MR', 'Den')
+
+        class Boom:
+            async def pa_context_get_sink_info_list(self):
+                raise OSError('pulse went away')
+        p = type('P', (), {})()
+        p.lib_pulse = Boom()
+        p.av_control_point = type('C', (), {'closing': False})()
+        called = []
+
+        async def fresh(pulse, renderer):
+            called.append(renderer.description)
+            return None
+        m._orig_pulse_register = fresh
+        asyncio.run(m._pulse_register(p, r))
+        self.assertEqual(called, ['Den'])
+
+    # --- keeping on the way out -------------------------------------------
+    def test_a_shutdown_leaves_the_sink_loaded(self):
+        m = load()
+        p, _ = self.pulse(m, [], closing=True)
+        unregistered = []
+        m._orig_pulse_unregister = lambda *a: unregistered.append(a)
+        nullsink = m._pulseaudio.NullSink(self.sink('Sonos Play:1-uuid:x_MR'))
+        asyncio.run(m._pulse_unregister(p, nullsink))
+        self.assertEqual(unregistered, [], 'sink was unloaded on shutdown')
+
+    def test_a_zone_going_away_still_unloads_its_sink(self):
+        # Not a restart: the speaker is gone and its output must go with it.
+        m = load()
+        p, _ = self.pulse(m, [], closing=False)
+        unregistered = []
+
+        async def orig(pulse, nullsink):
+            unregistered.append(nullsink.sink.name)
+        m._orig_pulse_unregister = orig
+        name = 'Sonos Play:1-uuid:x_MR'
+        m._adopted_sinks.add(name)
+        asyncio.run(m._pulse_unregister(
+            p, m._pulseaudio.NullSink(self.sink(name))))
+        self.assertEqual(unregistered, [name])
+        self.assertNotIn(name, m._adopted_sinks)
+
+    # --- sweeping what nothing claimed ------------------------------------
+    def test_only_sonos_null_sinks_are_candidates(self):
+        m = load()
+        self.assertEqual(
+            m._sonos_null_sinks(self.MODULES),
+            [(536870916, 'Sonos Play:1-uuid:RINCON_000E58A0B1C201400_MR'),
+             (536870918, 'Sonos Playbar-uuid:RINCON_000E58A0B1C301400_MR')])
+        self.assertEqual(m._sonos_null_sinks(''), [])
+        self.assertEqual(m._sonos_null_sinks(None), [])
+
+    def test_the_sweep_spares_adopted_sinks_and_clears_the_rest(self):
+        m = load()
+        m.SINK_SWEEP_DELAY = 0
+        m._adopted_sinks.add('Sonos Play:1-uuid:RINCON_000E58A0B1C201400_MR')
+        calls = []
+
+        class Result:
+            stdout = self.MODULES
+        def run(cmd, **kw):
             calls.append(cmd)
-            if cmd == ['pactl', 'list', 'clients']:
-                return FakeRun(clients_text)
-            if cmd == ['pactl', 'list', 'short', 'modules']:
-                return FakeRun(self.MODULES)
-            return FakeRun('')
-        return fake_run
-
-    def test_only_sonos_null_sinks_are_stale(self):
-        m = load()
-        self.assertEqual(m._stale_null_sink_modules(self.MODULES), [536870916, 536870918])
-        self.assertEqual(m._stale_null_sink_modules(''), [])
-        self.assertEqual(m._stale_null_sink_modules(None), [])
-
-    def test_client_detection(self):
-        m = load()
-        self.assertTrue(m._pa_dlna_client_alive(self.CLIENTS_WITH_PA_DLNA))
-        self.assertFalse(m._pa_dlna_client_alive(self.CLIENTS_WITHOUT))
-        self.assertFalse(m._pa_dlna_client_alive(''))
-
-    def test_cleanup_skipped_while_another_instance_runs(self):
-        m = load()
-        calls = []
+            return Result()
         import subprocess
         original = subprocess.run
-        subprocess.run = self.fake_pactl(self.CLIENTS_WITH_PA_DLNA, calls)
+        subprocess.run = run
         try:
-            self.assertEqual(m._unload_stale_sinks(), 0)
+            m._sweep_unadopted_sinks()
         finally:
             subprocess.run = original
-        self.assertFalse(any(c[:2] == ['pactl', 'unload-module'] for c in calls))
+        unloaded = [c[-1] for c in calls if c[:2] == ['pactl', 'unload-module']]
+        self.assertEqual(unloaded, ['536870918'])
 
-    def test_cleanup_unloads_exactly_the_stale_ones(self):
+    def test_the_sweep_never_raises(self):
         m = load()
-        calls = []
+        m.SINK_SWEEP_DELAY = 0
         import subprocess
         original = subprocess.run
-        subprocess.run = self.fake_pactl(self.CLIENTS_WITHOUT, calls)
-        m.emit = lambda *a, **k: None
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError('no pactl'))
         try:
-            self.assertEqual(m._unload_stale_sinks(), 2)
+            m._sweep_unadopted_sinks()          # must not raise
         finally:
             subprocess.run = original
-        unloaded = [c[2] for c in calls if c[:2] == ['pactl', 'unload-module']]
-        self.assertEqual(unloaded, ['536870916', '536870918'])
 
 
 class ReplayRing(unittest.TestCase):

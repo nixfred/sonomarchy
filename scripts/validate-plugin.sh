@@ -42,7 +42,11 @@ ok "no symlinks"
 
 [[ -x sonomarchy-backend ]] || fail "sonomarchy-backend is not executable"
 bash -n sonomarchy-backend || fail "sonomarchy-backend has a syntax error"
-python3 -m py_compile sonomarchy.py || fail "sonomarchy.py does not compile"
+# -B, and a throwaway cache dir: py_compile writes __pycache__ into the plugin
+# directory otherwise, and the shell reloads the plugin when that directory
+# changes -- which restarts the backend (see FIX 15 and sonomarchy-backend).
+PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -B -m py_compile sonomarchy.py \
+  || fail "sonomarchy.py does not compile"
 ok "backend scripts compile"
 
 grep -q "^$(jq -r .version manifest.json)" <(grep -oE '^## [0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | sed 's/^## //') \

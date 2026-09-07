@@ -151,6 +151,10 @@ the plugin will say so rather than fail silently.
 - **Changing networks** (dock/undock, wifi↔ethernet) restarts the backend
   automatically. Zones disappear for a few seconds and come back with correct
   stream addresses.
+- **A backend restart does not move your audio.** The zones stay in the output
+  list across a restart and anything playing stays on the speaker — you may
+  hear a short gap while the stream is re-established, but your output device
+  does not change under you.
 - **Track changes** are seamless as long as your player starts the next track
   within 10 s. After you stop playing, the speaker holds the stream for about
   10 s before releasing.

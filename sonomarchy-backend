@@ -173,4 +173,11 @@ if [[ -n "${SONOMARCHY_DRY_RUN:-}" ]]; then
   exit 0
 fi
 
-exec "$VENV_DIR/bin/python" -u "$PLUGIN_DIR/sonomarchy.py" "${args[@]}"
+# -B: never write __pycache__. The shell watches this plugin directory, and
+# a .pyc landing in it is a file change -- which reloads the plugin, which
+# tears down this backend and starts another one, which writes the .pyc
+# again. Caught on 2026-09-07 with inotify: the reload fired in the same
+# second as the MOVED_TO of sonomarchy.cpython-314.pyc. Every such reload
+# used to drop the Sonos null-sinks, so anything playing hopped to the
+# built-in speakers and back (see FIX 15).
+exec "$VENV_DIR/bin/python" -B -u "$PLUGIN_DIR/sonomarchy.py" "${args[@]}"

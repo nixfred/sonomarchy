@@ -15,4 +15,6 @@ else
   exit 1
 fi
 
-exec "$PY" -m unittest discover -s tests -v
+# -B for the same reason the backend uses it: a .pyc written into the plugin
+# directory is a file change the shell reloads on.
+exec "$PY" -B -m unittest discover -s tests -v

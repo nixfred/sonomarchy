@@ -119,8 +119,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
+from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '0.1.9'
+VERSION = '0.1.10'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -1609,63 +1610,19 @@ _pa_dlna.Renderer.__init__ = _renderer_init
 
 
 # ===========================================================================
-# FIX 9 - clean up sinks a previous backend left behind
+# FIX 9 - clean up sinks a previous backend left behind  (SUPERSEDED by FIX 15)
 # ===========================================================================
-# `omarchy plugin update` makes the shell reload the plugin; the old backend is
-# torn down before pa-dlna can unload its null-sink modules. A crash does the
-# same. The leftovers then sit in the sound menu as duplicate, dead zones next
-# to the live ones. pa-dlna's own single-instance check counts live PulseAudio
-# clients, so it neither notices nor removes them.
+# A reloaded or crashed backend used to leave its null-sink modules loaded,
+# and they sat in the sound menu as duplicate, dead zones. FIX 9 cleared every
+# Sonos null-sink at startup.
 #
-# Only done when no pa-dlna client is alive: a running instance's sinks are
-# in use, and it will refuse to let us start anyway.
-def _stale_null_sink_modules(short_modules):
-    """Indices of pa-dlna Sonos null-sinks in `pactl list short modules` text.
-
-    Text on purpose: PipeWire's pactl reports every module's index as null in
-    `-f json` output, while the tab-separated short listing has been stable
-    across PulseAudio and PipeWire for years.
-    """
-    stale = []
-    for line in (short_modules or '').splitlines():
-        parts = line.split('\t')
-        if len(parts) < 2 or parts[1] != 'module-null-sink':
-            continue
-        argument = parts[2] if len(parts) > 2 else ''
-        if 'uuid:RINCON_' in argument and parts[0].strip().isdigit():
-            stale.append(int(parts[0]))
-    return stale
-
-
-def _pa_dlna_client_alive(clients_text):
-    """True if `pactl list clients` shows a client named pa-dlna."""
-    return 'application.name = "pa-dlna"' in (clients_text or '')
-
-
-def _unload_stale_sinks():
-    import subprocess
-
-    def pactl(*args):
-        return subprocess.run(['pactl', *args], capture_output=True,
-                              text=True, timeout=5).stdout or ''
-
-    try:
-        if _pa_dlna_client_alive(pactl('list', 'clients')):
-            return 0
-        stale = _stale_null_sink_modules(pactl('list', 'short', 'modules'))
-        for index in stale:
-            subprocess.run(['pactl', 'unload-module', str(index)],
-                           capture_output=True, timeout=5)
-        if stale:
-            logger.warning(f'unloaded {len(stale)} stale Sonos null-sink(s) '
-                           f'left behind by a previous backend')
-            emit('cleanup', unloaded=len(stale))
-        return len(stale)
-    except Exception as e:
-        logger.debug(f'stale sink cleanup skipped: {e!r}')
-        return 0
-
-
+# FIX 15 makes that wrong: sinks are now deliberately left loaded across a
+# restart and adopted by the replacement, so clearing them at startup would
+# throw away the one playback is sitting on -- which is the whole bug FIX 15
+# exists to stop. The leftovers FIX 9 was written for are now swept by
+# _sweep_unadopted_sinks() once discovery has settled and it is possible to
+# tell a stale sink from one a zone is about to claim.
+#
 # ===========================================================================
 # FIX 10 - a stream that dies must be able to come back
 # ===========================================================================
@@ -2122,11 +2079,174 @@ def _ensure_resume_loop(control_point):
         logger.warning(f'resume loop not started: {e!r}')
 
 
+
+# ===========================================================================
+# FIX 15 - a backend restart must not move the user's audio
+# ===========================================================================
+# The backend does not decide when it restarts. The shell owns the process and
+# recreates it whenever it reloads its plugin tree, which on this machine it
+# did 16 times between 09:59 and 11:19 on 2026-09-07 with nothing in
+# Sonomarchy asking for it (the grouping watchdog recorded no rebuilds all
+# day, the address watch logged nothing, and SIGTERM shutdown measures 0.10 s
+# with no sinks left behind).
+#
+# That was harmless until you were listening. Unloading the null-sinks makes
+# every zone vanish from PipeWire, so anything playing is moved to the
+# built-in speakers; when the replacement backend loads the sinks again the
+# stream is restored to the Sonos. Audible result: the music hops to the
+# laptop and back every time the shell reloads.
+#
+# Fix: stop treating a null-sink as owned by one backend process. On the way
+# out, leave the sinks loaded -- the sink never disappears, so nothing moves.
+# On the way in, adopt the sink that is already there instead of loading a
+# second one. What the user hears is a short gap while the encoder restarts,
+# not their output device changing underneath them.
+#
+# Two things this must not break:
+#
+#   * A renderer that goes away for real (a speaker switched off, a 'byebye')
+#     still unloads its sink. Only a shutdown of the whole control point keeps
+#     them, which is the case where something is coming back.
+#   * A sink whose label no longer matches is reloaded rather than adopted.
+#     That is the FIX 13 regroup path: "Office (Sonos Playbar)" becoming
+#     "Living Room + Office" is exactly the moment the sound menu MUST change,
+#     and moving the stream is the correct cost there.
+#
+# Anything left over -- a zone that never came back, a sink from an older
+# version -- is swept once discovery has settled, so a stale entry cannot sit
+# in the sound menu doing nothing.
+
+# Seconds after start before unclaimed Sonos sinks are swept. Must clear
+# discovery: registration fills _adopted_sinks as each zone is found.
+SINK_SWEEP_DELAY = 90
+
+# Null-sink names this backend is answering for.
+_adopted_sinks = set()
+
+
+def _sink_description(sink):
+    """The device.description currently on a libpulse Sink, or ''."""
+    try:
+        proplist = getattr(sink, 'proplist', None) or {}
+        return proplist.get('device.description') or ''
+    except Exception:
+        return ''
+
+
+def _null_sink_name(renderer):
+    """The sink name pa-dlna uses for a renderer (see Pulse.register)."""
+    return f'{renderer.getattr("modelName")}-{renderer.upnp_device.UDN}'
+
+
+_orig_pulse_register = _pulseaudio.Pulse.register
+
+
+async def _pulse_register(self, renderer):
+    if self.lib_pulse is not None:
+        try:
+            name = _null_sink_name(renderer)
+            for sink in await self.lib_pulse.pa_context_get_sink_info_list():
+                if sink.name != name:
+                    continue
+                if _sink_description(sink) == renderer.description:
+                    logger.info(f'adopting the null-sink already loaded for '
+                                f'{renderer.description}: anything playing '
+                                f'stays on the speaker')
+                    _adopted_sinks.add(name)
+                    return _pulseaudio.NullSink(sink)
+                # The label changed -- a regroup (FIX 13). The sound menu has
+                # to change, so reload rather than adopt.
+                logger.info(f'null-sink {name} is labelled '
+                            f'{_sink_description(sink)!r} but should be '
+                            f'{renderer.description!r}; reloading it')
+                await self.lib_pulse.pa_context_unload_module(
+                                                        sink.owner_module)
+                break
+        except Exception as e:
+            # Fail back to upstream's behaviour: load a fresh sink.
+            logger.debug(f'could not adopt an existing null-sink: {e!r}')
+
+    nullsink = await _orig_pulse_register(self, renderer)
+    if nullsink is not None:
+        _adopted_sinks.add(nullsink.sink.name)
+    return nullsink
+
+
+_pulseaudio.Pulse.register = _pulse_register
+
+_orig_pulse_unregister = _pulseaudio.Pulse.unregister
+
+
+async def _pulse_unregister(self, nullsink):
+    control_point = getattr(self, 'av_control_point', None)
+    if control_point is not None and getattr(control_point, 'closing', False):
+        # The whole control point is going down, which on this machine almost
+        # always means the shell is about to start a replacement. Leave the
+        # sink loaded so PipeWire has no reason to move anything.
+        logger.info(f'leaving null-sink {nullsink.sink.name} loaded so '
+                    f'playback stays put across the restart')
+        return
+    _adopted_sinks.discard(nullsink.sink.name)
+    return await _orig_pulse_unregister(self, nullsink)
+
+
+_pulseaudio.Pulse.unregister = _pulse_unregister
+
+
+def _sonos_null_sinks(short_modules):
+    """[(module index, sink name)] for Sonos null-sinks in `pactl` output."""
+    import re
+    found = []
+    for line in (short_modules or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) < 3 or parts[1] != 'module-null-sink':
+            continue
+        if 'uuid:RINCON_' not in parts[2] or not parts[0].strip().isdigit():
+            continue
+        name = re.search(r'sink_name="([^"]+)"', parts[2])
+        found.append((int(parts[0]), name.group(1) if name else ''))
+    return found
+
+
+def _sweep_unadopted_sinks():
+    """Unload Sonos null-sinks no zone claimed, once discovery has settled.
+
+    FIX 15 keeps sinks across a restart, so they can no longer be cleared
+    wholesale at startup -- that would throw away the very thing we mean to
+    adopt. Instead, whatever is still unclaimed after discovery is stale for
+    real: a speaker that never came back, or a leftover from an older version.
+    """
+    time.sleep(SINK_SWEEP_DELAY)
+    try:
+        import subprocess
+        listing = subprocess.run(['pactl', 'list', 'short', 'modules'],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout or ''
+        unloaded = 0
+        for index, name in _sonos_null_sinks(listing):
+            if name and name in _adopted_sinks:
+                continue
+            subprocess.run(['pactl', 'unload-module', str(index)],
+                           capture_output=True, timeout=5)
+            unloaded += 1
+        if unloaded:
+            logger.warning(f'unloaded {unloaded} Sonos null-sink(s) that no '
+                           f'zone claimed')
+            emit('cleanup', unloaded=unloaded)
+    except Exception as e:
+        logger.debug(f'unadopted sink sweep skipped: {e!r}')
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     emit('starting', version=VERSION)
-    _unload_stale_sinks()
+    # FIX 15: sinks are adopted, not recreated, so they must NOT be cleared
+    # here -- that would throw away the ones playback is sitting on. Whatever
+    # no zone claims is swept once discovery has settled.
     _announce_firewall_rules(argv)
+    threading.Thread(target=_sweep_unadopted_sinks,
+                     name='sink-sweep',
+                     daemon=True).start()
     threading.Thread(target=_watch_addresses,
                      args=(_nics_from_argv(argv),),
                      name='address-watch',

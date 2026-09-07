@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.10 — 2026-09-07
+
+Music kept hopping from the Sonos to the laptop speakers and back. Two causes,
+both ours, found by instrumenting rather than guessing.
+
+- Fixed: **the backend wrote Python bytecode into its own plugin directory,
+  and the shell reloads a plugin when that directory changes.** The reload
+  tore down the backend, and the replacement wrote the `.pyc` again. Caught
+  with inotify: the reload fired in the same second as the `MOVED_TO` of
+  `sonomarchy.cpython-314.pyc`. The backend, the test runner and the validator
+  now all run Python with `-B`, so nothing lands in the watched directory.
+- Fixed: **a backend restart dropped every Sonos output.** Unloading the
+  null-sinks makes the zones vanish from PipeWire, so anything playing is
+  moved to the built-in speakers, and moved back when the sinks reappear —
+  audible as the output device flipping. Sinks are now left loaded when the
+  control point shuts down and adopted by the replacement, so playback stays
+  where it is. Verified on hardware: the backend was killed mid-playback, the
+  three sinks survived, the stream never left the Sonos, and both rooms of the
+  group kept playing.
+  - A renderer that genuinely goes away still unloads its sink; only a
+    shutdown of the whole control point keeps them, which is the case where
+    something is coming back.
+  - A sink whose label no longer matches is reloaded rather than adopted —
+    that is the regroup path from 0.1.7, where the sound menu *must* change.
+- Changed: FIX 9's startup sweep of every Sonos null-sink is gone; with sinks
+  now adopted, clearing them at startup would throw away the one playback is
+  sitting on. Whatever no zone claims is swept 90 s in, once discovery has
+  settled and a stale sink can be told from one about to be claimed.
+
 ## 0.1.9 — 2026-09-07
 
 Hardening pass over the grouping work, driven by attacking it rather than by
