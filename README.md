@@ -14,14 +14,16 @@ up natively with lower latency.
 
 Sonomarchy is a thin, Sonos-specific layer over
 [pa-dlna](https://gitlab.com/xdegaye/pa-dlna). It is *output only* — it does
-not control playback, groups or volume on the speakers. For that, pair it with
+not control playback, grouping or volume on the speakers — though it does
+follow the grouping you set in the Sonos app. For control, pair it with
 [OmaSonos](https://github.com/ctl0v0/omasonos); the two don't overlap.
 
 ## How it works
 
 - The backend discovers Sonos players over UPnP and creates one PipeWire
-  null-sink per **zone** (bonded stereo partners, surrounds and Subs are
-  hidden — they can't be played to on their own).
+  null-sink per **thing you can actually play to**: bonded stereo partners,
+  surrounds and Subs are hidden because they can't be played to on their own,
+  and rooms you have grouped share a single sink named after all of them.
 - Selecting a zone's sink makes the speaker fetch an MP3 stream of that sink
   from this machine over HTTP. Latency is about 1–2 seconds: fine for music,
   wrong for video.
@@ -131,6 +133,15 @@ the plugin will say so rather than fail silently.
   is taken over when you select its sink: the Spotify session is ended so the
   stream can start. That's intentional — selecting the output means "play
   here".
+- **Grouped rooms are one output.** Group rooms in the Sonos app and they
+  appear as a single sink named after all of them — "Living Room + Office",
+  alphabetically, or "Kitchen + 3 more" past three rooms. The individual
+  rooms leave the output list on purpose: playing to one member of a group
+  pulls it *out* of the group and plays it alone, which is never what you
+  meant by grouping them. Group or ungroup while Sonomarchy is running and
+  the outputs rebuild within about half a minute; the zones disappear
+  briefly, as they do on a network change. A rebuild waits for playback to
+  end, so it will not cut your music short.
 - **Changing networks** (dock/undock, wifi↔ethernet) restarts the backend
   automatically. Zones disappear for a few seconds and come back with correct
   stream addresses.
