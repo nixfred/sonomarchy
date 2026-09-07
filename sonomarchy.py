@@ -120,7 +120,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 
-VERSION = '0.1.8'
+VERSION = '0.1.9'
 
 logger = logging.getLogger('sonomarchy')
 
@@ -140,6 +140,19 @@ FIREWALL_GRACE = 8
 
 # Seconds between Sonos grouping checks (FIX 13).
 GROUP_POLL_INTERVAL = 15
+
+# Grouping-driven rebuilds allowed inside GROUP_RESTART_WINDOW seconds
+# (FIX 13). A burst rather than a flat cooldown: a regroup legitimately needs
+# a second rebuild now and then, when the first one sampled the topology while
+# Sonos was still moving rooms between groups. What must be stopped is the
+# unbounded case, not the second one.
+# Five in five minutes: a person regrouping rooms in the Sonos app can
+# easily make three or four changes in a couple of minutes and every one of
+# them must be honoured, so the budget has to sit above human fiddling. A
+# speaker flapping on bad wifi regroups every few seconds and is still capped,
+# which is the only case this exists to stop.
+GROUP_RESTART_WINDOW = 300
+GROUP_RESTART_BURST = 5
 
 
 def emit(type_, **fields):
@@ -1043,12 +1056,20 @@ async def _register(self, renderer):
                     return
                 coord = player['coord']
                 if coord and coord != uuid:
-                    coord_zone = (topo['players'].get(coord, {}).get('zone')
-                                  or coord)
-                    logger.info(f'skipping {zone} ({uuid}): grouped with '
-                                f'{coord_zone}; the whole group plays through '
-                                f'a single sink')
-                    return
+                    # Hide a follower only when its coordinator is a player we
+                    # would actually register, so something takes its place in
+                    # the menu. A topology that names a coordinator we cannot
+                    # see -- malformed, or mid-change -- must not cost the user
+                    # the one speaker they can really play to.
+                    leader = topo['players'].get(coord)
+                    if leader is not None and not leader['invisible']:
+                        logger.info(f'skipping {zone} ({uuid}): grouped with '
+                                    f'{leader["zone"] or coord}; the whole '
+                                    f'group plays through a single sink')
+                        return
+                    logger.info(f'{zone} ({uuid}) claims coordinator {coord}, '
+                                f'which is not a playable zone here; offering '
+                                f'{zone} on its own rather than hiding it')
                 label = _group_label(uuid, topo)
                 if label:
                     # Set before pulse_register(): the null-sink module takes
@@ -1071,6 +1092,60 @@ async def _register(self, renderer):
 
 
 _pa_dlna.AVControlPoint.register = _register
+
+
+def _state_dir():
+    base = (os.environ.get('XDG_STATE_HOME')
+            or os.path.join(os.path.expanduser('~'), '.local', 'state'))
+    return os.path.join(base, 'io.github.nixfred.sonomarchy')
+
+
+def _grouping_restart_stamp():
+    return os.path.join(_state_dir(), 'last-grouping-restart')
+
+
+def _recent_grouping_restarts():
+    """Timestamps of grouping rebuilds inside the window, oldest first.
+
+    The rebuild discards this process, so an in-memory count would be
+    forgotten by the process that needs it; it lives on disk instead.
+    Anything unreadable returns [] -- failing open costs a rebuild, failing
+    closed would wedge rebuilds forever on one bad file.
+    """
+    try:
+        with open(_grouping_restart_stamp()) as stamp:
+            stamps = json.load(stamp)
+        now = time.time()
+        # A stamp in the future means the clock jumped; drop it rather than
+        # letting it hold rebuilds off until the clock catches up.
+        return sorted(float(t) for t in stamps
+                      if 0 <= now - float(t) < GROUP_RESTART_WINDOW)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.debug(f'grouping restart stamp unreadable: {e!r}')
+        return []
+
+
+def _grouping_rebuilds_exhausted():
+    """True when we have already rebuilt GROUP_RESTART_BURST times lately.
+
+    A group that keeps forming and dissolving -- a member on failing wifi is
+    the realistic case -- would otherwise exit the backend every few seconds
+    indefinitely: Service.qml treats a deliberate restart as fast and does NOT
+    apply its crash backoff, so nothing else would slow the loop down.
+    """
+    return len(_recent_grouping_restarts()) >= GROUP_RESTART_BURST
+
+
+def _record_grouping_restart():
+    try:
+        os.makedirs(_state_dir(), exist_ok=True)
+        stamps = _recent_grouping_restarts() + [time.time()]
+        with open(_grouping_restart_stamp(), 'w') as stamp:
+            json.dump(stamps[-GROUP_RESTART_BURST:], stamp)
+    except Exception as e:
+        logger.debug(f'could not record the grouping rebuild: {e!r}')
 
 
 def _grouping_changed(before, after):
@@ -1116,6 +1191,7 @@ def _watch_zone_groups():
     pending = None
     pending_polls = 0
     deferred = False
+    throttled = False
     while True:
         # Returns as soon as a Sonos tells us the household changed (FIX 14),
         # or after GROUP_POLL_INTERVAL if nothing does.
@@ -1139,7 +1215,8 @@ def _watch_zone_groups():
                 continue
 
             if not _grouping_changed(baseline, current):
-                pending, pending_polls, deferred = None, 0, False
+                pending, pending_polls = None, 0
+                deferred = throttled = False
                 continue
 
             # Sonos reports transient groupings while a regroup is in
@@ -1162,9 +1239,22 @@ def _watch_zone_groups():
                                 'playback ends')
                 continue
 
+            if _grouping_rebuilds_exhausted():
+                if not throttled:
+                    throttled = True
+                    logger.warning(
+                        f'Sonos grouping has changed {GROUP_RESTART_BURST} '
+                        f'times in the last {GROUP_RESTART_WINDOW}s; holding '
+                        f'off on further rebuilds. A group that keeps forming '
+                        f'and dissolving usually means a speaker with an '
+                        f'unstable connection. The outputs may be stale until '
+                        f'it settles.')
+                continue
+
             logger.warning('Sonos grouping changed; exiting so the shell '
                            'rebuilds the outputs and each group is offered '
                            'as one sink.')
+            _record_grouping_restart()
             emit('restart', reason='grouping_changed')
             os.kill(os.getpid(), signal.SIGTERM)
             return
@@ -1212,6 +1302,13 @@ GROUP_EVENT_LEASE = 1800
 # Seconds between checks that the subscription is still alive.
 GROUP_EVENT_POLL = 30
 
+# Seconds between attempts while we have NO subscription. Shorter on purpose:
+# no speaker is known until the first renderer registers, which is well after
+# this thread starts, and a grouping change restarts the backend -- so a slow
+# retry leaves the blind window open exactly when another change is likeliest.
+# Measured at 108 s from start to subscribed before this was split out.
+GROUP_EVENT_RETRY = 5
+
 _ZGT_EVENT_PATH = '/ZoneGroupTopology/Event'
 
 _group_wakeup = threading.Event()
@@ -1244,7 +1341,12 @@ class _ZgtEventHandler(BaseHTTPRequestHandler):
                 self.rfile.read(length)     # drained, then discarded on purpose
             self.send_response(200)
             self.send_header('Content-Length', '0')
+            # One NOTIFY per connection. Without this, a body we could not
+            # drain -- a chunked one carries no Content-Length -- would be
+            # read as the start of the next request on a kept-alive socket.
+            self.send_header('Connection', 'close')
             self.end_headers()
+            self.close_connection = True
         except Exception as e:
             logger.debug(f'malformed zone topology NOTIFY: {e!r}')
             return
@@ -1314,9 +1416,16 @@ def _event_request(ip, method, headers):
 
 
 def _lease_seconds(header):
-    """'Second-1800' -> 1800. Anything else -> the lease we asked for."""
+    """'Second-1800' -> 1800. Anything else -> the lease we asked for.
+
+    Clamped both ways. A lease of 0 would have us renewing continuously; one
+    larger than we asked for (seen from fuzzing, not from hardware) would push
+    the renewal past the moment the subscription actually lapses, and events
+    would stop with nothing logged.
+    """
     try:
-        return max(60, int((header or '').split('-', 1)[1]))
+        return min(GROUP_EVENT_LEASE,
+                   max(60, int((header or '').split('-', 1)[1])))
     except Exception:
         return GROUP_EVENT_LEASE
 
@@ -1379,8 +1488,16 @@ def _watch_zone_group_events(nics=None):
     if port is None:
         return
     atexit.register(_unsubscribe)
+    first = True
     while True:
-        time.sleep(GROUP_EVENT_POLL)
+        # Sleep at the END of the turn. Sleeping first left every backend
+        # unsubscribed for GROUP_EVENT_POLL seconds after start -- and a
+        # grouping change restarts the backend, so that blind window landed
+        # exactly when the next change was most likely.
+        if not first:
+            time.sleep(GROUP_EVENT_POLL if _event_state['sid']
+                       else GROUP_EVENT_RETRY)
+        first = False
         try:
             if _event_state['sid'] is not None:
                 if time.time() < _event_state['renew_at']:

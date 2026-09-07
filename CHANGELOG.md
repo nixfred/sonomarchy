@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.9 — 2026-09-07
+
+Hardening pass over the grouping work, driven by attacking it rather than by
+re-reading it. Everything here was found by fuzzing the parser, timing the
+event path, or watching a real regroup on real speakers with the debug log on.
+
+- Fixed: a follower whose coordinator was not itself a playable zone got
+  hidden with nothing taking its place, costing the user the one speaker they
+  could actually play to. Found by fuzzing a topology whose Coordinator is not
+  among its own members. A follower is now hidden only when its coordinator is
+  a zone we would really register.
+- Fixed: the event thread slept before its first turn, so nothing was
+  subscribed for a full poll interval after every start — and since a grouping
+  change restarts the backend, that blind window landed exactly when the next
+  change was likeliest. It now acts first and sleeps after, and retries every
+  5 s while unsubscribed instead of every 30 s. Measured on hardware: 108 s
+  from start to subscribed, now 5.0 s.
+- Fixed: a NOTIFY reply left the connection open, so a body we could not drain
+  — a chunked one carries no Content-Length — would have been read as the start
+  of the next request. One NOTIFY per connection now.
+- Fixed: a speaker granting a subscription lease longer than we asked for
+  would have had us schedule the renewal past the point the lease actually
+  lapsed, stopping events with nothing logged. Leases are clamped both ways.
+- Added: a cap on grouping-driven rebuilds — five per five minutes. A group
+  that keeps forming and dissolving (a member on failing wifi) would otherwise
+  exit the backend every few seconds forever, because Service.qml treats a
+  deliberate restart as fast and does not apply its crash backoff. The budget
+  sits above human fiddling on purpose: someone regrouping rooms in the Sonos
+  app can easily make three or four changes in a couple of minutes and every
+  one must be honoured. It survives restarts by living on disk, and anything
+  unreadable, corrupt, or stamped in the future fails open.
+
 ## 0.1.8 — 2026-09-07
 
 Regrouping shows up at once instead of within half a minute — where the

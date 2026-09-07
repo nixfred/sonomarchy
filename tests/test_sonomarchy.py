@@ -320,10 +320,22 @@ class GroupLabel(unittest.TestCase):
         self.assertEqual(m._group_label('RINCON_CAFE01', flipped),
                          'Living Room + Office')
 
+    def test_an_empty_group_is_not_a_group(self):
+        m = load()
+        self.assertIsNone(m._group_label('a', {'players': {}, 'groups': {'a': ()}}))
+
     def test_a_lone_speaker_gets_no_group_label(self):
         m = load()
         self.assertIsNone(m._group_label('RINCON_DECAF0', GROUPED))
         self.assertIsNone(m._group_label('RINCON_0FF1CE', ungrouped()))
+
+    def test_three_rooms_are_all_named(self):
+        # The boundary: three fit, four summarise.
+        m = load()
+        topo = {'players': {u: {'zone': z, 'coord': 'a', 'invisible': False}
+                            for u, z in zip('abc', ['Office', 'Den', 'Patio'])},
+                'groups': {'a': ('a', 'b', 'c')}}
+        self.assertEqual(m._group_label('a', topo), 'Den + Office + Patio')
 
     def test_a_big_group_is_summarised(self):
         m = load()
@@ -349,7 +361,7 @@ class GroupLabel(unittest.TestCase):
 class GroupedRegistration(unittest.TestCase):
     """What the sound menu ends up offering."""
 
-    def outputs(self, m, topo):
+    def outputs(self, m, topo, players=None):
         registered = []
         m._topo_cache.update(topo=topo, ts=float('inf'), fresh=True)
         m._ensure_resume_loop = lambda cp: None
@@ -362,7 +374,7 @@ class GroupedRegistration(unittest.TestCase):
 
         # A fixed set of renderers: discovery does not depend on what the
         # topology says, which is the whole point of the empty-topology case.
-        for uuid, player in GROUPED['players'].items():
+        for uuid, player in (players or GROUPED['players']).items():
             renderer = type('R', (), {})()
             renderer.upnp_device = type('D', (), {'UDN': f'uuid:{uuid}_MR'})()
             renderer.root_device = type('RD', (), {
@@ -384,6 +396,29 @@ class GroupedRegistration(unittest.TestCase):
             ['Den (Sonos Play:1)', 'Living Room (Sonos Play:1)',
              'Office (Sonos Play:1)'])
 
+    def test_a_follower_whose_coordinator_is_missing_is_still_offered(self):
+        # Hiding it would cost the user the only speaker they can play to,
+        # because nothing else in the menu covers that room.
+        m = load()
+        topo = {'players': {'RINCON_0FF1CE': {'zone': 'Office',
+                                              'coord': 'RINCON_GH0S7',
+                                              'invisible': False}},
+                'groups': {'RINCON_GH0S7': ('RINCON_0FF1CE',)}}
+        self.assertEqual(self.outputs(m, topo, players=topo['players']),
+                         ['Office (Sonos Play:1)'])
+
+    def test_a_follower_whose_coordinator_is_bonded_is_still_offered(self):
+        m = load()
+        topo = {'players': {'RINCON_0FF1CE': {'zone': 'Office',
+                                              'coord': 'RINCON_CAFE01',
+                                              'invisible': False},
+                            'RINCON_CAFE01': {'zone': 'Office',
+                                              'coord': 'RINCON_CAFE01',
+                                              'invisible': True}},
+                'groups': {'RINCON_CAFE01': ()}}
+        self.assertIn('Office (Sonos Play:1)',
+                      self.outputs(m, topo, players=topo['players']))
+
     def test_an_unknown_topology_registers_everything(self):
         # Fail open: better a speaker that should have been hidden than a
         # missing one.
@@ -399,6 +434,29 @@ class GroupingChange(unittest.TestCase):
     def test_an_identical_topology_is_not(self):
         m = load()
         self.assertFalse(m._grouping_changed(GROUPED, GROUPED))
+
+    def test_no_known_speakers_is_not_a_topology_change(self):
+        m = load()
+        m._sonos_ips.clear()
+        self.assertIsNone(m._refresh_topology())
+
+    def test_every_speaker_failing_is_not_a_topology_change(self):
+        m = load()
+        m._sonos_ips[:] = ['192.0.2.10', '192.0.2.11']
+
+        def boom(ip):
+            raise OSError('unreachable')
+        m._fetch_topology = boom
+        self.assertIsNone(m._refresh_topology())
+
+    def test_the_speaker_that_answered_is_asked_first_next_time(self):
+        m = load()
+        m._sonos_ips[:] = ['192.0.2.10', '192.0.2.11']
+        m._fetch_topology = (lambda ip: (_ for _ in ()).throw(OSError())
+                             if ip == '192.0.2.10'
+                             else {'players': {}, 'groups': {}})
+        m._refresh_topology()
+        self.assertEqual(m._sonos_ips[0], '192.0.2.11')
 
     def test_a_speaker_dropping_off_wifi_is_not_a_regrouping(self):
         m = load()
@@ -1143,6 +1201,13 @@ class TopologyEvents(unittest.TestCase):
         m = load()
         self.assertEqual(m._lease_seconds('Second-1'), 60)
 
+    def test_a_lease_longer_than_we_asked_for_is_capped(self):
+        # Otherwise the renewal is scheduled past the point the subscription
+        # actually lapses, and events stop with nothing logged.
+        m = load()
+        self.assertEqual(m._lease_seconds('Second-99999999999999999999'),
+                         m.GROUP_EVENT_LEASE)
+
     def test_subscribe_sends_a_callback_the_speaker_can_reach(self):
         m = load()
         sent = {}
@@ -1219,6 +1284,9 @@ class TopologyEvents(unittest.TestCase):
                 data=b'<propertyset/>', method='NOTIFY')
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self.assertEqual(resp.status, 200)
+                # One NOTIFY per connection: a body we could not drain would
+                # otherwise be read as the next request on a kept-alive socket.
+                self.assertEqual(resp.headers.get('Connection'), 'close')
             self.assertTrue(m._group_wakeup.wait(2))
             self.assertEqual(m._event_state['notifies'], 1)
         finally:
@@ -1231,6 +1299,171 @@ class TopologyEvents(unittest.TestCase):
         m.GROUP_EVENT_PORTS = range(1, 2)      # port 1: not ours to bind
         self.assertIsNone(m._start_event_listener())
         self.assertIsNone(m._event_state['server'])
+
+
+class EventLoopStart(unittest.TestCase):
+    """The subscription must not wait a poll interval to happen."""
+
+    def drive(self, m, turns=1):
+        subscribed, slept = [], []
+
+        class Stop(BaseException):
+            pass
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if len(slept) >= turns:
+                raise Stop
+        m._start_event_listener = lambda nics=None: 8090
+        m._subscribe = lambda ip, port: subscribed.append((ip, port))
+        m.time = type('T', (), {'sleep': staticmethod(sleep),
+                                'time': staticmethod(lambda: 0.0)})()
+        m._sonos_ips.append('192.0.2.10')
+        try:
+            m._watch_zone_group_events(['wlan0'])
+        except Stop:
+            pass
+        return subscribed, slept
+
+    def test_it_subscribes_before_sleeping(self):
+        # The bug: sleeping first left every backend unsubscribed for a whole
+        # GROUP_EVENT_POLL, and a grouping change restarts the backend, so the
+        # blind window landed exactly when the next change was most likely.
+        m = load()
+        subscribed, slept = self.drive(m)
+        self.assertEqual(subscribed, [('192.0.2.10', 8090)])
+        self.assertEqual(len(slept), 1, 'slept more than once before stopping')
+
+    def test_it_retries_quickly_while_nothing_is_subscribed(self):
+        # No speaker is known until the first renderer registers, long after
+        # this thread starts. Waiting a full GROUP_EVENT_POLL to look again
+        # left a measured 108 s with no subscription after every restart.
+        m = load()
+        slept = []
+
+        class Stop(BaseException):
+            pass
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if len(slept) >= 2:
+                raise Stop
+        m._start_event_listener = lambda nics=None: 8090
+        m.time = type('T', (), {'sleep': staticmethod(sleep),
+                                'time': staticmethod(lambda: 0.0)})()
+        m._sonos_ips.clear()            # nothing discovered yet
+        try:
+            m._watch_zone_group_events(['wlan0'])
+        except Stop:
+            pass
+        self.assertEqual(slept, [m.GROUP_EVENT_RETRY] * 2)
+
+    def test_it_backs_off_once_subscribed(self):
+        m = load()
+        slept = []
+
+        class Stop(BaseException):
+            pass
+
+        def sleep(seconds):
+            slept.append(seconds)
+            raise Stop
+        m._start_event_listener = lambda nics=None: 8090
+        m._subscribe = lambda ip, port: m._event_state.update(
+            sid='uuid:x', ip=ip, renew_at=1e18)
+        m.time = type('T', (), {'sleep': staticmethod(sleep),
+                                'time': staticmethod(lambda: 0.0)})()
+        m._sonos_ips.append('192.0.2.10')
+        try:
+            m._watch_zone_group_events(['wlan0'])
+        except Stop:
+            pass
+        self.assertEqual(slept, [m.GROUP_EVENT_POLL])
+
+    def test_a_listener_that_cannot_start_gives_up_quietly(self):
+        m = load()
+        m._start_event_listener = lambda nics=None: None
+        called = []
+        m._subscribe = lambda ip, port: called.append(ip)
+        m._watch_zone_group_events(['wlan0'])      # must return, not spin
+        self.assertEqual(called, [])
+
+
+class GroupingRebuildBurst(unittest.TestCase):
+    """A flapping group must not restart the backend forever."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get('XDG_STATE_HOME')
+        os.environ['XDG_STATE_HOME'] = self.tmp
+
+    def tearDown(self):
+        import shutil
+        if self.old is None:
+            os.environ.pop('XDG_STATE_HOME', None)
+        else:
+            os.environ['XDG_STATE_HOME'] = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_nothing_recorded_means_nothing_held_off(self):
+        m = load()
+        self.assertFalse(m._grouping_rebuilds_exhausted())
+
+    def test_a_regroup_needing_a_second_rebuild_still_gets_one(self):
+        # The case that made a flat cooldown wrong: the first rebuild can
+        # sample the topology while Sonos is still moving rooms, and the
+        # correction must not be suppressed.
+        m = load()
+        m._record_grouping_restart()
+        self.assertFalse(m._grouping_rebuilds_exhausted())
+        m._record_grouping_restart()
+        self.assertFalse(m._grouping_rebuilds_exhausted())
+
+    def test_a_flapping_group_is_eventually_held_off(self):
+        m = load()
+        for _ in range(m.GROUP_RESTART_BURST):
+            m._record_grouping_restart()
+        self.assertTrue(m._grouping_rebuilds_exhausted())
+
+    def test_the_budget_refills_once_the_window_passes(self):
+        m = load()
+        for _ in range(m.GROUP_RESTART_BURST):
+            m._record_grouping_restart()
+        self.assertTrue(m._grouping_rebuilds_exhausted())
+        stale = time.time() - m.GROUP_RESTART_WINDOW - 1
+        with open(m._grouping_restart_stamp(), 'w') as stamp:
+            json.dump([stale] * m.GROUP_RESTART_BURST, stamp)
+        self.assertFalse(m._grouping_rebuilds_exhausted())
+
+    def test_the_stamp_file_does_not_grow_without_bound(self):
+        m = load()
+        for _ in range(50):
+            m._record_grouping_restart()
+        with open(m._grouping_restart_stamp()) as stamp:
+            self.assertLessEqual(len(json.load(stamp)), m.GROUP_RESTART_BURST)
+
+    def test_a_corrupt_stamp_fails_open(self):
+        m = load()
+        os.makedirs(m._state_dir(), exist_ok=True)
+        for junk in ('', 'not json', '{}', '[1, "x"]', '[null]'):
+            with open(m._grouping_restart_stamp(), 'w') as stamp:
+                stamp.write(junk)
+            self.assertFalse(m._grouping_rebuilds_exhausted())
+
+    def test_stamps_from_the_future_are_dropped(self):
+        # A clock jump must not wedge rebuilds until the clock catches up.
+        m = load()
+        os.makedirs(m._state_dir(), exist_ok=True)
+        with open(m._grouping_restart_stamp(), 'w') as stamp:
+            json.dump([time.time() + 86400] * m.GROUP_RESTART_BURST, stamp)
+        self.assertFalse(m._grouping_rebuilds_exhausted())
+
+    def test_an_unwritable_state_dir_does_not_raise(self):
+        m = load()
+        m._state_dir = lambda: '/proc/nope/nowhere'
+        m._record_grouping_restart()               # must not raise
+        self.assertFalse(m._grouping_rebuilds_exhausted())
 
 
 if __name__ == '__main__':
