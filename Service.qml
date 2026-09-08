@@ -154,6 +154,11 @@ Item {
       case "restart":
         restartReason = plainText(message.reason, 64)
         state = "restarting"
+        // The backend logs its own WARNING before asking for this, but that
+        // line only exists when it chose to exit. Repeating the reason here is
+        // what lets the journal tell a deliberate restart from a crash or from
+        // an unrelated plugin reload -- see onExited and onDestruction.
+        console.warn("Sonomarchy: backend asked to restart (" + restartReason + ")")
         break
       case "sweep":
         // Only emitted when a zone has a player but no live stream.
@@ -209,9 +214,16 @@ Item {
       settleTimer.restart()
     }
 
-    onExited: function(exitCode) {
+    onExited: function(exitCode, exitStatus) {
       root.zones = ({})
-      if (root.expectedStop) return
+      // exitStatus is QProcess.CrashExit when a signal ended it, which is the
+      // normal shape of the backend's own deliberate exit (it SIGTERMs itself)
+      // as well as of a real crash. Only restartReason separates the two.
+      var died = exitStatus === 1 ? "killed by a signal" : "exit code " + exitCode
+      if (root.expectedStop) {
+        console.log("Sonomarchy: backend stopped on request (" + died + ")")
+        return
+      }
 
       if (!root.healthyThisRun && root.setupError !== "") {
         // Nothing will change until the user fixes it; do not spin.
@@ -223,7 +235,8 @@ Item {
 
       // A deliberate exit (address change, IPC restart) comes back fast; a
       // crash backs off up to 30 s.
-      var deliberate = root.restartReason !== ""
+      var reason = root.restartReason
+      var deliberate = reason !== ""
       root.restartReason = ""
       root.state = "restarting"
       if (!deliberate) {
@@ -231,12 +244,30 @@ Item {
         root.restartAttempt = Math.min(root.restartAttempt + 1, 6)
       }
       restartTimer.interval = deliberate ? 1000 : Math.min(30000, 1000 * Math.pow(2, root.restartAttempt))
+      // Without this the journal shows a stream that simply stopped and came
+      // back, and there is no way to tell a crash from a planned rebuild. It
+      // cost an hour of mtime archaeology on 2026-09-08 to answer "is this a
+      // bug or the network?", so the answer is now written down as it happens.
+      console.warn("Sonomarchy: backend " + (deliberate ? "restarting (" + reason + ")"
+                                                        : "stopped unexpectedly (" + died + ")")
+                   + "; restarting in " + restartTimer.interval + " ms"
+                   + (deliberate ? "" : ", attempt " + root.restartAttempt))
       restartTimer.restart()
     }
   }
 
   Process {
     id: osd
+  }
+
+  // Any local plugin changing on disk makes the shell unload EVERY plugin
+  // service, this one included; the backend dies with the Process object and
+  // onExited never runs. Without this line that teardown is invisible and the
+  // resulting gap in the music looks like a network fault. It is the loudest
+  // thing Sonomarchy can do about it from inside the plugin.
+  Component.onDestruction: {
+    if (backend.running) console.warn("Sonomarchy: the shell is unloading this plugin's"
+      + " service; the backend and any stream it is running go with it")
   }
 
   Timer {

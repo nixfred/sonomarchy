@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.11 — 2026-09-08
+
+Diagnosis only: no behaviour change. Answering "is the music skipping a bug or
+the network?" took an hour of comparing file mtimes against process start
+times, because a backend that is torn down and restarted looks, in the journal,
+exactly like a stream that stopped and came back.
+
+- Added: **the backend now says why it restarted.** `onExited` logs the exit
+  code (and whether a signal ended it), whether the restart was deliberate and
+  for what reason, and how long the backoff will be. The `restart` message from
+  the backend logs its `reason` — `address_lost` or `grouping_changed` — where
+  previously it set a property nothing ever printed.
+- Added: a line when the shell unloads this plugin's service with the backend
+  still running. Any local plugin changing on disk makes the shell unload
+  *every* plugin service, so editing an unrelated plugin restarts Sonomarchy
+  and cuts the stream for the ~6 s the replacement needs to rediscover the
+  household. That is the shell's design, not a fault, and it is out of this
+  plugin's hands — but it should not be invisible.
+- Note: a plugin reload re-instantiates the *cached* compiled QML, so an edit
+  to `Service.qml` does not take effect until `omarchy restart shell`. Measured
+  on 2026-09-08 with a marker in `Component.onCompleted`: the reload spawned a
+  fresh backend and reset the once-per-instance firewall hint, but ran the
+  pre-edit code. Only `sonomarchy.py` is genuinely hot-reloaded.
+
 ## 0.1.10 — 2026-09-07
 
 Music kept hopping from the Sonos to the laptop speakers and back. Two causes,
