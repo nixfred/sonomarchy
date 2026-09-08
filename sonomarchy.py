@@ -279,6 +279,111 @@ def _prepare_request_state(renderer, headers):
     return start
 
 
+# ===========================================================================
+# FIX 17 - some firmware refuses the fake-Content-Length response
+# ===========================================================================
+# The response below advertises a 100 GiB Content-Length and Accept-Ranges so
+# that a speaker which loses the socket can resume with a Range request (see
+# the replay ring). Sonos firmware 86.8 (ZPS9: Playbar, Play:1) accepts that
+# happily. Firmware 92.0 (ZPS17: Move) does not -- it reads the headers, takes
+# ~10 KB, and resets the connection after 2.4 s, every time, forever.
+#
+# Upstream pa-dlna answers `Transfer-Encoding: chunked` with no length, which
+# is what a live stream honestly is. That works on the new firmware but gives
+# up Range resumes, so it is not the right answer for every speaker either.
+# The framing is therefore per renderer: chunked for the ones that need it,
+# length-plus-ranges for the rest.
+def _use_chunked(renderer):
+    # Resolved once per renderer: _sonos_uuid walks the UPnP device each call
+    # and this runs on every response.
+    flag = getattr(renderer, '_sonomarchy_chunked', None)
+    if flag is None:
+        uuid = _sonos_uuid(renderer)
+        flag = bool(uuid) and uuid in _chunked_uuids()
+        renderer._sonomarchy_chunked = flag
+        if flag:
+            logger.warning(f'{renderer.name}: pinned to chunked transfer '
+                           f'encoding; Range resumes are not available for '
+                           f'this speaker')
+    return flag
+
+
+def _chunked_uuids():
+    """UUIDs pinned to chunked framing by the user, one per line.
+
+    A support switch and the way the behaviour is tested:
+    `echo RINCON_x > ~/.local/state/io.github.nixfred.sonomarchy/chunked`
+    """
+    try:
+        with open(os.path.join(_state_dir(), 'chunked')) as pinned:
+            return {line.strip() for line in pinned if line.strip()}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        logger.debug(f'chunked pin list unreadable: {e!r}')
+        return set()
+
+
+# A speaker refusing the response looks distinctive: it takes a few KB, waits,
+# and resets. A listener who simply stopped the music produces one drop, not a
+# run of them -- so two consecutive short drops is enough to act on, and the
+# decision is written to the pin file so the next start does not repeat the
+# 35 seconds of silence it costs to learn.
+CHUNKED_SHORT_BYTES = 64 * 1024
+CHUNKED_SHORT_SECONDS = 5.0
+CHUNKED_STRIKES = 2
+
+
+def _pin_chunked(uuid):
+    """Remember that this player needs chunked framing, across restarts."""
+    if not uuid:
+        return
+    try:
+        pinned = _chunked_uuids()
+        if uuid in pinned:
+            return
+        os.makedirs(_state_dir(), exist_ok=True)
+        with open(os.path.join(_state_dir(), 'chunked'), 'w') as out:
+            out.write('\n'.join(sorted(pinned | {uuid})) + '\n')
+    except Exception as e:
+        logger.debug(f'could not pin {uuid} to chunked: {e!r}')
+
+
+def _note_short_drop(renderer, sent, elapsed):
+    """Switch a renderer to chunked framing after repeated tiny drops.
+
+    Returns True when this drop caused the switch, for the tests.
+    """
+    if _use_chunked(renderer):
+        return False
+    if sent >= CHUNKED_SHORT_BYTES or elapsed >= CHUNKED_SHORT_SECONDS:
+        renderer._sonomarchy_short_drops = 0
+        return False
+    strikes = getattr(renderer, '_sonomarchy_short_drops', 0) + 1
+    renderer._sonomarchy_short_drops = strikes
+    if strikes < CHUNKED_STRIKES:
+        return False
+    renderer._sonomarchy_chunked = True
+    uuid = _sonos_uuid(renderer)
+    logger.warning(
+        f'{renderer.name}: dropped the stream after a few KB '
+        f'{strikes} times running. That is firmware refusing a response with '
+        f'a Content-Length it cannot use, not a network fault -- switching '
+        f'this speaker to chunked transfer encoding, which costs Range '
+        f'resumes and nothing else. Remove {uuid} from '
+        f'{os.path.join(_state_dir(), "chunked")} to undo.')
+    _pin_chunked(uuid)
+    return True
+
+
+def _chunked_ok_lines(mime_type):
+    return ['HTTP/1.1 200 OK',
+            'Content-type: ' + mime_type,
+            'Connection: close',
+            'Transfer-Encoding: chunked',
+            '', '']
+
+
 def _http_ok_lines(mime_type, range_start=None):
     """Response header lines. 206 with a Content-Range when resuming."""
     if range_start is not None and 0 < range_start < FAKE_CONTENT_LENGTH:
@@ -359,6 +464,13 @@ async def _write_http_ok(writer, renderer):
     range_start = getattr(renderer, '_sonomarchy_range_start', None)
     renderer._sonomarchy_range_start = None
     renderer._sonomarchy_replay = None
+    if _use_chunked(renderer):
+        # No length, no ranges: nothing to resume from, so the ring is dead
+        # weight here and a Range request cannot be honoured anyway.
+        writer.write('\r\n'.join(
+            _chunked_ok_lines(renderer.mime_type)).encode('latin-1'))
+        await writer.drain()
+        return
     if range_start is not None:
         ring = _ring(renderer)
         replay = ring.since(range_start)
@@ -389,9 +501,12 @@ async def _write_track(self, reader):
     gets the buffered bytes it missed.
     """
     renderer = self.session.renderer
+    chunked = _use_chunked(renderer)
     ring = _ring(renderer)
     replay = getattr(renderer, '_sonomarchy_replay', None)
     renderer._sonomarchy_replay = None
+    if chunked:
+        replay = None
     if replay is not None:
         _, missed = replay
         if missed:
@@ -408,8 +523,20 @@ async def _write_track(self, reader):
             data = e.partial
             partial_data = True
         if data:
-            ring.append(data)
-            self.writer.write(data)
+            if chunked:
+                # Upstream's framing: size in hex, CRLF, body, CRLF. The ring
+                # is deliberately not fed -- it only exists to answer a Range
+                # request, and a chunked response never gets one.
+                self.writer.write(f'{len(data):x}\r\n'.encode('latin-1'))
+                self.writer.write(data)
+                self.writer.write(b'\r\n')
+            else:
+                ring.append(data)
+                self.writer.write(data)
+            # Counted for both framings: the ring is only fed in one of them,
+            # so it cannot be what tells us how much audio the speaker got.
+            renderer._sonomarchy_sent = (
+                getattr(renderer, '_sonomarchy_sent', 0) + len(data))
             await self.writer.drain()
         if not data or partial_data:
             logger.debug(f'EOF reading from pipe on {self.task_name}')
@@ -1825,6 +1952,13 @@ async def _track_run(self, reader):
     """
     assert self.task is not None
     renderer = self.session.renderer
+    # How much audio actually reached the speaker before it hung up is the
+    # one fact that separates the two causes of a drop: a starved stream
+    # (nothing playing into the sink, encoder dead) sends ~nothing, while a
+    # speaker rejecting the response sends a couple of seconds of perfectly
+    # good MP3 first. Without this the log looks identical either way.
+    started = time.monotonic()
+    sent_at_start = getattr(renderer, '_sonomarchy_sent', 0)
     try:
         await _http_server.write_http_ok(self.writer, renderer)
         _http_server.logger.debug(f'{self.task_name}: track is started')
@@ -1834,9 +1968,12 @@ async def _track_run(self, reader):
         self.session.stream_tasks.create_task(self.shutdown(),
                                               name='shutdown')
     except ConnectionError as e:
+        sent = getattr(renderer, '_sonomarchy_sent', 0) - sent_at_start
+        elapsed = time.monotonic() - started
         logger.warning(f'{self.task_name}: speaker dropped the connection '
-                       f'({e!r}); keeping the zone, the stream will be '
-                       f're-established')
+                       f'({e!r}) after {sent} bytes in {elapsed:.1f}s; '
+                       f'keeping the zone, the stream will be re-established')
+        _note_short_drop(renderer, sent, elapsed)
         await self.session.close_session(shutdown_coro=True)
     except Exception:
         await self.session.close_session(shutdown_coro=True)
@@ -1862,8 +1999,17 @@ async def _track_shutdown(self):
         return
     writer = self.writer
     self.writer = None
+    # A renderer pinned to chunked framing (FIX 17) is the one case where the
+    # terminator upstream sends IS correct, so it comes back for those.
+    # Defensively: shutdown also runs on half-built tracks, where reaching
+    # through to the renderer would raise and lose the socket cleanup.
+    session = getattr(self, 'session', None)
+    renderer = getattr(session, 'renderer', None)
+    chunked = renderer is not None and _use_chunked(renderer)
     try:
         try:
+            if chunked and not writer.is_closing():
+                writer.write(b'0' + b'\r\n' + b'\r\n')
             await writer.drain()
             writer.close()
             await writer.wait_closed()

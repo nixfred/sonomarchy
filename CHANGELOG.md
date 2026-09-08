@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.13 — 2026-09-08
+
+A newly added Sonos Move was selectable in the sound menu and silent. It was
+not the firewall, the network, or discovery: the speaker fetched the stream
+every time, took about 10 KB of it, and reset the connection after 2.4 s,
+forever.
+
+- Fixed: **newer Sonos firmware refuses our resumable response.** FIX 1
+  replaced upstream's `Transfer-Encoding: chunked` with a fake 100 GiB
+  `Content-Length` plus `Accept-Ranges`, so that a speaker which loses the
+  socket can resume through the replay ring. Firmware 86.8 (ZPS9 — Playbar,
+  Play:1) accepts that; 92.0 (ZPS17 — Move) does not. The framing is now
+  chosen per renderer: chunked for the speakers that need it, length-and-ranges
+  for the rest, with the chunk terminator restored for the chunked ones.
+- Added: **the switch is detected, not configured.** Two consecutive drops
+  that are both tiny (< 64 KB) and quick (< 5 s) are firmware refusing the
+  response, not a listener walking away — that flips the speaker to chunked
+  and records its UUID in `~/.local/state/io.github.nixfred.sonomarchy/chunked`
+  so the next start does not pay the ~35 s of silence again. Delete the line to
+  undo it.
+- Added: the connection-drop warning now says how many bytes went out and over
+  how long. That single number is what separated "the speaker is refusing us"
+  (10240 bytes in 2.4 s) from "the stream is starved", and the log read
+  identically for both before.
+- Verified on hardware: pinned, the Move played continuously with zero drops
+  where every previous attempt died at 2.4 s; the other three zones were
+  unaffected.
+
 ## 0.1.12 — 2026-09-08
 
 0.1.11 did not load. It added a second `Component.onDestruction` to a file that

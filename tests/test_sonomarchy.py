@@ -1588,5 +1588,106 @@ class GroupingRebuildBurst(unittest.TestCase):
         self.assertFalse(m._grouping_rebuilds_exhausted())
 
 
+
+class ChunkedFallback(unittest.TestCase):
+    """Firmware that refuses the fake-Content-Length response (FIX 17).
+
+    Sonos 92.0 (ZPS17, the Move) takes ~10 KB of a 256 kbps stream, waits, and
+    resets after 2.4 s -- forever, so the zone is selectable and silent. 86.8
+    (ZPS9) plays the same response happily. The framing is therefore chosen per
+    renderer, and a speaker that behaves this way is detected rather than
+    configured.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get('XDG_STATE_HOME')
+        os.environ['XDG_STATE_HOME'] = self.tmp
+
+    def tearDown(self):
+        import shutil
+        if self.old is None:
+            os.environ.pop('XDG_STATE_HOME', None)
+        else:
+            os.environ['XDG_STATE_HOME'] = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def renderer(uuid='RINCON_48A6B8EB4C1E01400', name='Move'):
+        device = type('Device', (), {'UDN': 'uuid:%s_MR' % uuid})()
+        return type('Renderer', (), {'name': name, 'upnp_device': device,
+                                     'mime_type': 'audio/mp3'})()
+
+    def test_a_speaker_nobody_pinned_keeps_the_resumable_response(self):
+        m = load()
+        self.assertFalse(m._use_chunked(self.renderer()))
+
+    def test_a_pinned_speaker_gets_chunked(self):
+        m = load()
+        m._pin_chunked('RINCON_48A6B8EB4C1E01400')
+        self.assertTrue(m._use_chunked(self.renderer()))
+
+    def test_pinning_one_speaker_does_not_move_the_others(self):
+        m = load()
+        m._pin_chunked('RINCON_48A6B8EB4C1E01400')
+        other = self.renderer(uuid='RINCON_B8E9377FE4DA01400', name='Office')
+        self.assertFalse(m._use_chunked(other))
+
+    def test_the_two_responses_are_mutually_exclusive(self):
+        m = load()
+        chunked = ' '.join(m._chunked_ok_lines('audio/mp3'))
+        length = ' '.join(m._http_ok_lines('audio/mp3'))
+        self.assertIn('Transfer-Encoding: chunked', chunked)
+        self.assertNotIn('Content-Length', chunked)
+        self.assertIn('Content-Length', length)
+        self.assertNotIn('Transfer-Encoding', length)
+
+    def test_one_short_drop_is_not_enough_to_switch(self):
+        # A listener who stops the music produces exactly one.
+        m = load()
+        r = self.renderer()
+        self.assertFalse(m._note_short_drop(r, 10240, 2.4))
+        self.assertFalse(m._use_chunked(r))
+
+    def test_two_short_drops_running_switch_the_speaker(self):
+        m = load()
+        r = self.renderer()
+        m._note_short_drop(r, 10240, 2.4)
+        self.assertTrue(m._note_short_drop(r, 10240, 2.4))
+        self.assertTrue(m._use_chunked(r))
+
+    def test_the_switch_survives_a_restart(self):
+        m = load()
+        r = self.renderer()
+        m._note_short_drop(r, 10240, 2.4)
+        m._note_short_drop(r, 10240, 2.4)
+        # A fresh process, a fresh renderer object: the pin file is the memory.
+        self.assertIn('RINCON_48A6B8EB4C1E01400', load()._chunked_uuids())
+
+    def test_a_real_listening_session_does_not_count(self):
+        m = load()
+        r = self.renderer()
+        m._note_short_drop(r, 10240, 2.4)
+        m._note_short_drop(r, 5 * 1024 * 1024, 180.0)   # someone listened
+        self.assertFalse(m._note_short_drop(r, 10240, 2.4))
+        self.assertFalse(m._use_chunked(r))
+
+    def test_a_speaker_already_on_chunked_is_left_alone(self):
+        m = load()
+        r = self.renderer()
+        r._sonomarchy_chunked = True
+        self.assertFalse(m._note_short_drop(r, 0, 0.1))
+
+    def test_pinning_is_idempotent(self):
+        m = load()
+        m._pin_chunked('RINCON_48A6B8EB4C1E01400')
+        m._pin_chunked('RINCON_48A6B8EB4C1E01400')
+        self.assertEqual(len(m._chunked_uuids()), 1)
+
+    def test_a_missing_pin_file_is_not_an_error(self):
+        m = load()
+        self.assertEqual(m._chunked_uuids(), set())
+
 if __name__ == '__main__':
     unittest.main()
