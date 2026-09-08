@@ -376,6 +376,45 @@ def _note_short_drop(renderer, sent, elapsed):
     return True
 
 
+def _frame_chunk(data):
+    """One HTTP/1.1 chunk: size in hex, CRLF, body, CRLF."""
+    return f'{len(data):x}\r\n'.encode('latin-1') + data + b'\r\n'
+
+
+# A chunked response is a live radio stream to the speaker, and it starts
+# playing almost as soon as bytes arrive -- with next to nothing in reserve.
+# Every later byte can only arrive at real time (it is being captured live),
+# so the reserve never grows, and any stall on the link is heard at once. On
+# the Move's 2.4 GHz link that was a pulse roughly once a second: measured
+# 694 retransmissions in 15 minutes, each one a ~200-300 ms hole.
+#
+# The only way to give the speaker a reserve is to be deliberately late: hold
+# the first PREROLL_SECONDS of audio and send it as one burst. The speaker
+# then plays that far behind live, and because it consumes at exactly the
+# rate we deliver, it stays that far behind -- a standing cushion that
+# swallows a stalled link. Music does not care about 1.5 s of delay; Sonos
+# adds more than that on its own.
+PREROLL_SECONDS = 1.5
+
+
+async def _hold_preroll(reader, seconds, chunk_size):
+    """Collect up to `seconds` of encoder output; less if it ends sooner."""
+    held = bytearray()
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            data = await asyncio.wait_for(reader.read(chunk_size), remaining)
+        except asyncio.TimeoutError:
+            break
+        if not data:
+            break
+        held += data
+    return bytes(held)
+
+
 def _chunked_ok_lines(mime_type):
     return ['HTTP/1.1 200 OK',
             'Content-type: ' + mime_type,
@@ -507,6 +546,13 @@ async def _write_track(self, reader):
     renderer._sonomarchy_replay = None
     if chunked:
         replay = None
+        held = await _hold_preroll(reader, PREROLL_SECONDS,
+                                   _http_server.HTTP_CHUNK_SIZE)
+        if held:
+            self.writer.write(_frame_chunk(held))
+            renderer._sonomarchy_sent = (
+                getattr(renderer, '_sonomarchy_sent', 0) + len(held))
+            await self.writer.drain()
     if replay is not None:
         _, missed = replay
         if missed:
@@ -524,12 +570,9 @@ async def _write_track(self, reader):
             partial_data = True
         if data:
             if chunked:
-                # Upstream's framing: size in hex, CRLF, body, CRLF. The ring
-                # is deliberately not fed -- it only exists to answer a Range
-                # request, and a chunked response never gets one.
-                self.writer.write(f'{len(data):x}\r\n'.encode('latin-1'))
-                self.writer.write(data)
-                self.writer.write(b'\r\n')
+                # The ring is deliberately not fed -- it only exists to answer
+                # a Range request, and a chunked response never gets one.
+                self.writer.write(_frame_chunk(data))
             else:
                 ring.append(data)
                 self.writer.write(data)
@@ -1973,8 +2016,18 @@ async def _client_connected(self, reader, writer):
 # Measured over 6 s on the same monitor source:
 #     default            724992 bytes, 12 stalls > 50 ms (~0.37 s apart)
 #     --latency-msec=50 1052672 bytes, steady 53 ms cadence
-# 175 KB/s is real time; the default was not keeping up at all.
-PAREC_LATENCY_MSEC = 50
+# (The default's byte count is simply 4 s of real time after its 2 s fill,
+# not a slower rate -- an earlier reading of it as "68% of real time" was
+# wrong.)
+#
+# 50 ms turned out to be too small in the other direction: it makes the TCP
+# stream a dribble of ~1.6 KB every 50 ms, and a "thin" stream like that can
+# only recover a late ACK by retransmission timeout. On the Move's 2.4 GHz
+# link that produced ~0.8 spurious retransmits a second (694 in 15 min, 92 %
+# of them DSACK'd) and an audible pulse to match. 250 ms gives ~8 KB bursts
+# -- several segments in flight, so fast retransmit works -- while staying
+# far below the two-second default that lumped the audio in the first place.
+PAREC_LATENCY_MSEC = 250
 
 _orig_run_parec = _http_server.StreamProcesses.run_parec
 

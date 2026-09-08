@@ -1780,10 +1780,12 @@ class ParecLatency(unittest.TestCase):
         argv = self.capture_argv(m, ['/usr/bin/parec'])
         self.assertIn('--latency-msec=%d' % m.PAREC_LATENCY_MSEC, argv)
 
-    def test_the_latency_is_short_enough_to_matter(self):
-        # The whole point is a buffer far below the two seconds measured.
+    def test_the_latency_is_neither_a_lump_nor_a_dribble(self):
+        # Two seconds lumped the audio; 50 ms made a thin TCP stream that
+        # could only recover a late ACK by timeout. Either extreme is a bug.
         m = load()
-        self.assertLessEqual(m.PAREC_LATENCY_MSEC, 200)
+        self.assertGreaterEqual(m.PAREC_LATENCY_MSEC, 100)
+        self.assertLessEqual(m.PAREC_LATENCY_MSEC, 500)
 
     def test_an_explicit_latency_is_left_alone(self):
         m = load()
@@ -1798,3 +1800,52 @@ class ParecLatency(unittest.TestCase):
         cmd = ['/usr/bin/parec']
         self.capture_argv(m, cmd)
         self.assertEqual(cmd, ['/usr/bin/parec'])
+
+
+class ChunkedPreroll(unittest.TestCase):
+    """A chunked stream needs a standing cushion against a stalled link."""
+
+    def hold(self, module, seconds, chunk, *pieces, eof=True):
+        # The reader must be born inside the loop it is read from.
+        async def go():
+            r = asyncio.StreamReader()
+            for piece in pieces:
+                r.feed_data(piece)
+            if eof:
+                r.feed_eof()
+            return await module._hold_preroll(r, seconds, chunk)
+        return asyncio.run(go())
+
+    def test_a_chunk_is_framed_like_upstream(self):
+        m = load()
+        self.assertEqual(m._frame_chunk(b'abc'), b'3\r\nabc\r\n')
+        self.assertEqual(m._frame_chunk(b'x' * 4096),
+                         b'1000\r\n' + b'x' * 4096 + b'\r\n')
+
+    def test_everything_produced_before_the_deadline_is_held(self):
+        m = load()
+        held = self.hold(m, 0.2, 64, b'a' * 100, b'b' * 100)
+        self.assertEqual(held, b'a' * 100 + b'b' * 100)
+
+    def test_an_encoder_that_ends_early_does_not_hold_the_speaker(self):
+        m = load()
+        t0 = time.monotonic()
+        held = self.hold(m, 5.0, 64, b'a' * 10)
+        self.assertEqual(held, b'a' * 10)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_the_deadline_is_honoured_when_the_encoder_is_slow(self):
+        m = load()
+        t0 = time.monotonic()
+        # No EOF: more might come, and never does.
+        held = self.hold(m, 0.3, 64, b'a' * 10, eof=False)
+        self.assertEqual(held, b'a' * 10)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.25)
+        self.assertLess(time.monotonic() - t0, 1.5)
+
+    def test_the_cushion_is_worth_having_but_not_a_wait(self):
+        # Must exceed a ~300 ms link stall by a margin; must not approach the
+        # few seconds after which a speaker gives up waiting for a body.
+        m = load()
+        self.assertGreaterEqual(m.PREROLL_SECONDS, 1.0)
+        self.assertLessEqual(m.PREROLL_SECONDS, 2.0)

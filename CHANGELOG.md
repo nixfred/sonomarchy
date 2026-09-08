@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.16 — 2026-09-08
+
+0.1.15 made the Move worse: a steady pulse instead of a stutter. The kernel
+said why. The socket to the Move showed 694 retransmissions in 15 minutes,
+92 % of them DSACK'd — the packets arrived, the ACKs came back late — on a
+speaker sitting in INFRA mode on 2.4 GHz. Each one collapses the congestion
+window and holes the stream for 200–300 ms, and a chunked "radio" stream has
+almost nothing in reserve to cover a hole.
+
+- Fixed: **the capture latency of 50 ms was a thin stream.** ~1.6 KB every
+  50 ms is too few segments in flight for fast retransmit, so every late ACK
+  cost a full timeout. Now 250 ms: ~8 KB bursts, still far below the two
+  seconds that lumped the audio in 0.1.14 and earlier.
+- Added: **a 1.5 s cushion for chunked streams.** The first 1.5 s of audio is
+  held and sent as one burst, so the speaker plays that far behind live and,
+  consuming at exactly the rate we deliver, stays that far behind. A stalled
+  link now drains the reserve instead of the speaker.
+- Corrected: 0.1.15's claim that the default capture ran at "68 % of real
+  time" was wrong — that byte count is four seconds of real time after a two
+  second fill. The lumps were real; the rate was not.
+
 ## 0.1.15 — 2026-09-08
 
 The Move played, but it stuttered about once a second. Every session-level
