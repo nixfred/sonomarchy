@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.1 — 2026-09-08
+
+Still pulsing on the Move, with the capture clean and the link unchanged. The
+reserve was the problem, and a measurement error had been hiding it.
+
+- Fixed: **the reserve was ~0.7 s, not 3.5 s.** `ss`'s `bytes_sent` counts
+  retransmitted bytes, and this link retransmits ~2 %, so the delivered-audio
+  figure read 12 s ahead of the speaker when the acknowledged bytes put it
+  under a second: the 3.5 s prime minus the ~2 s capture fill, with no
+  pre-buffer on the speaker's side. One back-to-back pair of retransmit
+  timeouts eats that. The prime is now 6 s, leaving ~3.5–4 s on a fresh start
+  and all 6 s on a reconnect. Music starts 6 s late, once.
+- Added: **linear retransmit timeouts on the stream socket.** A stream this
+  thin recovers a late ACK by timeout, and consecutive timeouts double by
+  default — 220, 440, 880 ms — which is what made the holes audible. With
+  `TCP_THIN_LINEAR_TIMEOUTS` they stay at the base RTO. `TCP_NODELAY` is set
+  explicitly rather than relied on.
+- Ruled out with numbers: speaker clock drift (0.9993 of ours over 150 s),
+  capture xruns (flat at load 9.6), and reconnects (one connection all along).
+
 ## 1.5.0 — 2026-09-08
 
 Version number only; no behaviour change from 0.1.17. The plugin has been

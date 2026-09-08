@@ -121,7 +121,7 @@ from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '1.5.0'   # kept equal to manifest.json by the validator
+VERSION = '1.5.1'   # kept equal to manifest.json by the validator
 
 logger = logging.getLogger('sonomarchy')
 
@@ -376,6 +376,33 @@ def _note_short_drop(renderer, sent, elapsed):
     return True
 
 
+def _tune_stream_socket(sock):
+    """Per-connection TCP options for a live stream over a jittery link.
+
+    TCP_THIN_LINEAR_TIMEOUTS: a stream this thin (a few segments in flight)
+    recovers a late ACK by retransmission timeout, and by default each
+    consecutive timeout doubles -- 220, 440, 880 ms -- which is what turns a
+    jittery 2.4 GHz link into audible holes. Linear keeps them at the base
+    RTO. TCP_NODELAY is asyncio's default for connected sockets; set anyway
+    so the behaviour does not depend on that staying true.
+    Returns the names applied, for the log and the tests; never raises.
+    """
+    import socket as _socket
+    applied = []
+    if sock is None:
+        return applied
+    for name, value in (('TCP_NODELAY', 1), ('TCP_THIN_LINEAR_TIMEOUTS', 1)):
+        opt = getattr(_socket, name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(_socket.IPPROTO_TCP, opt, value)
+            applied.append(name)
+        except OSError as e:
+            logger.debug(f'{name} not applied: {e!r}')
+    return applied
+
+
 def _frame_chunk(data):
     """One HTTP/1.1 chunk: size in hex, CRLF, body, CRLF."""
     return f'{len(data):x}\r\n'.encode('latin-1') + data + b'\r\n'
@@ -400,9 +427,12 @@ def _frame_chunk(data):
 # stream. Cost: the music starts SILENCE_PRIME_SECONDS late, once.
 #
 # Sized for the capture: the first fragment comes ~2 s after parec starts
-# (measured), so 3.5 s of silence leaves ~1.5 s standing reserve on a fresh
-# start and the full 3.5 s on a reconnect, where parec is already running.
-SILENCE_PRIME_SECONDS = 3.5
+# (measured), and the speaker adds no pre-buffer of its own for this stream,
+# so the standing reserve is the prime minus the fill. 3.5 s measured out at
+# ~0.7 s of real reserve (delivered-minus-retransmitted bytes against the
+# speaker's own RelTime), which one back-to-back pair of retransmit timeouts
+# eats. 6 s leaves ~3.5-4 s on a fresh start and all 6 s on a reconnect.
+SILENCE_PRIME_SECONDS = 6.0
 
 _silence_cache = {}
 
@@ -2012,6 +2042,8 @@ async def _client_connected(self, reader, writer):
                                        f'Cannot start {renderer.name} stream'
                                        f' (already running)')
                     break
+
+            _tune_stream_socket(writer.get_extra_info('socket'))
 
             # Resume (Range) or fresh representation (ring reset).
             _prepare_request_state(renderer,

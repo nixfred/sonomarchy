@@ -1852,9 +1852,35 @@ class SilencePrime(unittest.TestCase):
         # The first capture fragment arrives ~2 s after parec starts; the
         # prime must leave a real reserve after that, and not be so long the
         # start delay is silly.
+        # 3.5 s measured out at ~0.7 s of real reserve after the 2 s fill.
         m = load()
-        self.assertGreaterEqual(m.SILENCE_PRIME_SECONDS, 3.0)
-        self.assertLessEqual(m.SILENCE_PRIME_SECONDS, 5.0)
+        self.assertGreaterEqual(m.SILENCE_PRIME_SECONDS, 5.0)
+        self.assertLessEqual(m.SILENCE_PRIME_SECONDS, 8.0)
+
+    def test_the_stream_socket_gets_linear_timeouts(self):
+        import socket
+        m = load()
+        a, b = socket.socketpair(socket.AF_UNIX)   # setsockopt on TCP-only
+        try:                                       # options must not raise
+            applied = m._tune_stream_socket(a)
+            self.assertEqual(applied, [])          # not TCP: nothing applies
+        finally:
+            a.close(); b.close()
+        srv = socket.socket(); srv.bind(('127.0.0.1', 0)); srv.listen(1)
+        cli = socket.socket(); cli.connect(srv.getsockname()); acc, _ = srv.accept()
+        try:
+            applied = m._tune_stream_socket(acc)
+            self.assertIn('TCP_NODELAY', applied)
+            if hasattr(socket, 'TCP_THIN_LINEAR_TIMEOUTS'):
+                self.assertIn('TCP_THIN_LINEAR_TIMEOUTS', applied)
+                self.assertEqual(acc.getsockopt(socket.IPPROTO_TCP,
+                                                socket.TCP_THIN_LINEAR_TIMEOUTS), 1)
+        finally:
+            acc.close(); cli.close(); srv.close()
+
+    def test_no_socket_is_not_an_error(self):
+        m = load()
+        self.assertEqual(m._tune_stream_socket(None), [])
 
 if __name__ == '__main__':
     unittest.main()
