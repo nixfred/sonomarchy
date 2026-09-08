@@ -1689,9 +1689,6 @@ class ChunkedFallback(unittest.TestCase):
         m = load()
         self.assertEqual(m._chunked_uuids(), set())
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class FirewallProbeFalsePositive(unittest.TestCase):
     """FIX 8 must not blame a firewall for a speaker that did reach us.
@@ -1775,17 +1772,19 @@ class ParecLatency(unittest.TestCase):
         asyncio.run(module._run_parec(object(), object(), parec_cmd))
         return seen['cmd']
 
-    def test_a_latency_is_requested(self):
+    def test_no_latency_is_requested_by_default(self):
+        # 250 ms dropped audio 183 times in 27 min at load average 10. The
+        # server default is the slack that hides that; leave it alone.
         m = load()
+        self.assertIsNone(m.PAREC_LATENCY_MSEC)
         argv = self.capture_argv(m, ['/usr/bin/parec'])
-        self.assertIn('--latency-msec=%d' % m.PAREC_LATENCY_MSEC, argv)
+        self.assertEqual([a for a in argv if a.startswith('--latency')], [])
 
-    def test_the_latency_is_neither_a_lump_nor_a_dribble(self):
-        # Two seconds lumped the audio; 50 ms made a thin TCP stream that
-        # could only recover a late ACK by timeout. Either extreme is a bug.
+    def test_a_configured_latency_is_requested(self):
         m = load()
-        self.assertGreaterEqual(m.PAREC_LATENCY_MSEC, 100)
-        self.assertLessEqual(m.PAREC_LATENCY_MSEC, 500)
+        m.PAREC_LATENCY_MSEC = 400
+        argv = self.capture_argv(m, ['/usr/bin/parec'])
+        self.assertIn('--latency-msec=400', argv)
 
     def test_an_explicit_latency_is_left_alone(self):
         m = load()
@@ -1802,19 +1801,19 @@ class ParecLatency(unittest.TestCase):
         self.assertEqual(cmd, ['/usr/bin/parec'])
 
 
-class ChunkedPreroll(unittest.TestCase):
-    """A chunked stream needs a standing cushion against a stalled link."""
+class SilencePrime(unittest.TestCase):
+    """FIX 19: a chunked stream opens with a reserve of encoded silence."""
 
-    def hold(self, module, seconds, chunk, *pieces, eof=True):
-        # The reader must be born inside the loop it is read from.
-        async def go():
-            r = asyncio.StreamReader()
-            for piece in pieces:
-                r.feed_data(piece)
-            if eof:
-                r.feed_eof()
-            return await module._hold_preroll(r, seconds, chunk)
-        return asyncio.run(go())
+    class Encoder:
+        rate = 44100
+        channels = 2
+        sample_format = 's16le'
+
+        def __init__(self, command):
+            self.command = command
+
+    def prime(self, module, encoder, seconds):
+        return asyncio.run(module._silence_prime(encoder, seconds))
 
     def test_a_chunk_is_framed_like_upstream(self):
         m = load()
@@ -1822,30 +1821,40 @@ class ChunkedPreroll(unittest.TestCase):
         self.assertEqual(m._frame_chunk(b'x' * 4096),
                          b'1000\r\n' + b'x' * 4096 + b'\r\n')
 
-    def test_everything_produced_before_the_deadline_is_held(self):
+    def test_the_silence_is_the_encoders_own_output(self):
+        # `cat` stands in for the encoder: what comes out is exactly the PCM
+        # that went in, so the size proves both the format and the duration.
         m = load()
-        held = self.hold(m, 0.2, 64, b'a' * 100, b'b' * 100)
-        self.assertEqual(held, b'a' * 100 + b'b' * 100)
+        out = self.prime(m, self.Encoder(['cat']), 0.5)
+        self.assertEqual(len(out), int(44100 * 0.5) * 2 * 2)
+        self.assertEqual(out, bytes(len(out)))
 
-    def test_an_encoder_that_ends_early_does_not_hold_the_speaker(self):
+    def test_it_is_encoded_once_per_command(self):
         m = load()
-        t0 = time.monotonic()
-        held = self.hold(m, 5.0, 64, b'a' * 10)
-        self.assertEqual(held, b'a' * 10)
-        self.assertLess(time.monotonic() - t0, 1.0)
+        enc = self.Encoder(['cat'])
+        first = self.prime(m, enc, 0.25)
+        m._silence_cache[next(iter(m._silence_cache))] = b'cached'
+        self.assertEqual(self.prime(m, enc, 0.25), b'cached')
+        self.assertNotEqual(first, b'cached')
 
-    def test_the_deadline_is_honoured_when_the_encoder_is_slow(self):
+    def test_a_failing_encoder_means_no_reserve_not_a_crash(self):
         m = load()
-        t0 = time.monotonic()
-        # No EOF: more might come, and never does.
-        held = self.hold(m, 0.3, 64, b'a' * 10, eof=False)
-        self.assertEqual(held, b'a' * 10)
-        self.assertGreaterEqual(time.monotonic() - t0, 0.25)
-        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(self.prime(m, self.Encoder(['false']), 0.25), b'')
+        self.assertEqual(self.prime(m, self.Encoder(['/nonexistent/x']), 0.25),
+                         b'')
 
-    def test_the_cushion_is_worth_having_but_not_a_wait(self):
-        # Must exceed a ~300 ms link stall by a margin; must not approach the
-        # few seconds after which a speaker gives up waiting for a body.
+    def test_an_encoderless_stream_gets_raw_pcm(self):
         m = load()
-        self.assertGreaterEqual(m.PREROLL_SECONDS, 1.0)
-        self.assertLessEqual(m.PREROLL_SECONDS, 2.0)
+        out = self.prime(m, self.Encoder(None), 0.1)
+        self.assertEqual(len(out), int(44100 * 0.1) * 4)
+
+    def test_the_reserve_outlasts_the_capture_fill(self):
+        # The first capture fragment arrives ~2 s after parec starts; the
+        # prime must leave a real reserve after that, and not be so long the
+        # start delay is silly.
+        m = load()
+        self.assertGreaterEqual(m.SILENCE_PRIME_SECONDS, 3.0)
+        self.assertLessEqual(m.SILENCE_PRIME_SECONDS, 5.0)
+
+if __name__ == '__main__':
+    unittest.main()

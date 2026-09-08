@@ -381,38 +381,72 @@ def _frame_chunk(data):
     return f'{len(data):x}\r\n'.encode('latin-1') + data + b'\r\n'
 
 
+# ===========================================================================
+# FIX 19 - prime a chunked stream with silence so the speaker has a reserve
+# ===========================================================================
 # A chunked response is a live radio stream to the speaker, and it starts
 # playing almost as soon as bytes arrive -- with next to nothing in reserve.
 # Every later byte can only arrive at real time (it is being captured live),
 # so the reserve never grows, and any stall on the link is heard at once. On
-# the Move's 2.4 GHz link that was a pulse roughly once a second: measured
-# 694 retransmissions in 15 minutes, each one a ~200-300 ms hole.
+# the Move's 2.4 GHz link that was a pulse roughly once a second: 694
+# retransmissions in 15 minutes, each a ~200-300 ms hole.
 #
-# The only way to give the speaker a reserve is to be deliberately late: hold
-# the first PREROLL_SECONDS of audio and send it as one burst. The speaker
-# then plays that far behind live, and because it consumes at exactly the
-# rate we deliver, it stays that far behind -- a standing cushion that
-# swallows a stalled link. Music does not care about 1.5 s of delay; Sonos
-# adds more than that on its own.
-PREROLL_SECONDS = 1.5
+# 0.1.16 built the reserve by holding the first 1.5 s of audio, which coupled
+# the cushion to how fast the capture fills: with the two-second parec buffer
+# the first byte arrives after the hold has expired and nothing is held at
+# all. Sending pre-encoded silence instead gives the speaker its reserve in
+# the first packet, before the capture has produced anything. Live audio then
+# arrives behind it at real time and the lead is kept for the life of the
+# stream. Cost: the music starts SILENCE_PRIME_SECONDS late, once.
+#
+# Sized for the capture: the first fragment comes ~2 s after parec starts
+# (measured), so 3.5 s of silence leaves ~1.5 s standing reserve on a fresh
+# start and the full 3.5 s on a reconnect, where parec is already running.
+SILENCE_PRIME_SECONDS = 3.5
+
+_silence_cache = {}
 
 
-async def _hold_preroll(reader, seconds, chunk_size):
-    """Collect up to `seconds` of encoder output; less if it ends sooner."""
-    held = bytearray()
-    deadline = time.monotonic() + seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            data = await asyncio.wait_for(reader.read(chunk_size), remaining)
-        except asyncio.TimeoutError:
-            break
-        if not data:
-            break
-        held += data
-    return bytes(held)
+def _pcm_silence(encoder, seconds):
+    """Zero PCM in the format the encoder is fed."""
+    width = 2                                   # s16le / s16be
+    frames = int(getattr(encoder, 'rate', 44100) * seconds)
+    return bytes(frames * getattr(encoder, 'channels', 2) * width)
+
+
+async def _silence_prime(encoder, seconds=None):
+    """Encoded silence matching the live stream, or b'' if it cannot be made.
+
+    Runs the renderer's own encoder command on zero PCM, so the frames are
+    bit-for-bit the format the speaker is about to receive. Cached per
+    command: it is the same bytes every time and lame takes a moment.
+    """
+    seconds = SILENCE_PRIME_SECONDS if seconds is None else seconds
+    if seconds <= 0:
+        return b''
+    command = getattr(encoder, 'command', None)
+    pcm = _pcm_silence(encoder, seconds)
+    if not command:
+        return pcm                              # L16: raw PCM is the stream
+    key = (tuple(command), len(pcm))
+    cached = _silence_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(pcm), 20)
+    except Exception as e:
+        logger.warning(f'could not encode the silence prime ({e!r}); the '
+                       f'stream starts with no reserve')
+        return b''
+    if proc.returncode != 0 or not out:
+        logger.warning(f'encoder exited {proc.returncode} encoding the '
+                       f'silence prime; the stream starts with no reserve')
+        return b''
+    _silence_cache[key] = out
+    return out
 
 
 def _chunked_ok_lines(mime_type):
@@ -546,12 +580,11 @@ async def _write_track(self, reader):
     renderer._sonomarchy_replay = None
     if chunked:
         replay = None
-        held = await _hold_preroll(reader, PREROLL_SECONDS,
-                                   _http_server.HTTP_CHUNK_SIZE)
-        if held:
-            self.writer.write(_frame_chunk(held))
+        prime = await _silence_prime(getattr(renderer, 'encoder', None))
+        if prime:
+            self.writer.write(_frame_chunk(prime))
             renderer._sonomarchy_sent = (
-                getattr(renderer, '_sonomarchy_sent', 0) + len(held))
+                getattr(renderer, '_sonomarchy_sent', 0) + len(prime))
             await self.writer.drain()
     if replay is not None:
         _, missed = replay
@@ -2022,19 +2055,23 @@ async def _client_connected(self, reader, writer):
 #
 # 50 ms turned out to be too small in the other direction: it makes the TCP
 # stream a dribble of ~1.6 KB every 50 ms, and a "thin" stream like that can
-# only recover a late ACK by retransmission timeout. On the Move's 2.4 GHz
-# link that produced ~0.8 spurious retransmits a second (694 in 15 min, 92 %
-# of them DSACK'd) and an audible pulse to match. 250 ms gives ~8 KB bursts
-# -- several segments in flight, so fast retransmit works -- while staying
-# far below the two-second default that lumped the audio in the first place.
-PAREC_LATENCY_MSEC = 250
+# only recover a late ACK by retransmission timeout. 250 ms then failed the
+# moment the machine got busy: at load average 10 parec missed its 250 ms
+# deadline 183 times in 27 minutes, and every miss is a hole in the audio
+# before it reaches TCP. The two-second default was never the problem -- it
+# is the slack that hides scheduling stalls, and the ~0.37 s fragments it
+# delivers in are a fine TCP burst size. What was missing was a reserve on
+# the speaker's side, which FIX 19 provides without any waiting. So: no
+# latency request at all. The knob stays for a machine that needs it.
+PAREC_LATENCY_MSEC = None
 
 _orig_run_parec = _http_server.StreamProcesses.run_parec
 
 
 async def _run_parec(self, encoder, parec_cmd, stdout=None):
     """Add a latency request to the parec argv unless one is already there."""
-    if not any(str(arg).startswith('--latency') for arg in parec_cmd):
+    if PAREC_LATENCY_MSEC is not None and not any(
+            str(arg).startswith('--latency') for arg in parec_cmd):
         # A new list: upstream extends the one it is given, and mutating the
         # caller's would double the flag on a restarted track.
         parec_cmd = list(parec_cmd) + [f'--latency-msec={PAREC_LATENCY_MSEC}']

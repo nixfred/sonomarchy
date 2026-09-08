@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.17 — 2026-09-08
+
+The Move pulsed again, this time with the machine at load average 10. The
+network had actually improved; the capture had not.
+
+- Fixed: **the 250 ms capture buffer dropped audio under load.** `parec`
+  missed that deadline 183 times in 27 minutes, and each miss is a hole in the
+  audio before TCP ever sees it. The two-second server default is restored —
+  it was never the problem; it is the slack that hides scheduling stalls, and
+  the ~0.37 s fragments it delivers in are a fine TCP burst size. The latency
+  knob remains for a machine that needs it, off by default.
+- Changed: **the reserve is now pre-encoded silence, not a hold.** 0.1.16
+  held the first 1.5 s of audio, which tied the cushion to how fast the
+  capture fills — with the two-second buffer the first byte arrives after the
+  hold has expired and nothing is held. A chunked stream now opens with 3.5 s
+  of silence encoded by the renderer's own encoder command, so the speaker has
+  its reserve in the first packet, before the capture has produced anything.
+  Live audio arrives behind it at real time and the lead is kept. The music
+  starts 3.5 s late, once; on a reconnect the whole 3.5 s is reserve.
+- The silence is cached per encoder command, and an encoder that fails to
+  produce it costs the reserve, not the stream.
+
 ## 0.1.16 — 2026-09-08
 
 0.1.15 made the Move worse: a steady pulse instead of a stutter. The kernel
