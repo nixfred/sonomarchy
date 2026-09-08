@@ -121,7 +121,7 @@ from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '0.1.10'
+VERSION = '1.5.0'   # kept equal to manifest.json by the validator
 
 logger = logging.getLogger('sonomarchy')
 

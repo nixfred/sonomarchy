@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0 — 2026-09-08
+
+Version number only; no behaviour change from 0.1.17. The plugin has been
+doing real work in a real household for a while — this is the number that
+says so.
+
+- `VERSION` in `sonomarchy.py` had been stuck at 0.1.10 since the manifest
+  moved past it. It now reads 1.5.0, and the validator fails if the two ever
+  disagree again.
+
 ## 0.1.17 — 2026-09-08
 
 The Move pulsed again, this time with the machine at load average 10. The

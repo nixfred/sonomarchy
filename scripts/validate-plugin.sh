@@ -53,6 +53,13 @@ grep -q "^$(jq -r .version manifest.json)" <(grep -oE '^## [0-9]+\.[0-9]+\.[0-9]
   || fail "CHANGELOG.md has no entry for version $(jq -r .version manifest.json)"
 ok "changelog covers $(jq -r .version manifest.json)"
 
+# The backend reports its own VERSION; it sat at 0.1.10 for seven releases
+# because nothing compared it to the manifest.
+py_version="$(grep -oE "^VERSION = '[^']+'" sonomarchy.py | sed "s/.*'\(.*\)'/\1/")"
+[[ "$py_version" == "$(jq -r .version manifest.json)" ]] \
+  || fail "sonomarchy.py VERSION ($py_version) != manifest.json ($(jq -r .version manifest.json))"
+ok "backend VERSION matches manifest"
+
 # Qt ships these in a libexec-ish directory that is not on PATH on Arch, so a
 # bare `command -v` silently skipped both checks here for their whole life.
 find_qt_tool() {
