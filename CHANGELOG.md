@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.14 — 2026-09-08
+
+The Move was fixed in 0.1.13, but the log kept insisting the problem was a
+firewall while the speaker's own `GET` sat two lines above the warning.
+
+- Fixed: **FIX 8 no longer blames the firewall for a speaker that reached us.**
+  It tested `stream_sessions.is_playing`, which is equally false for "the port
+  is blocked" and for "the speaker fetched the stream and then dropped it" —
+  so a speaker refusing our response (FIX 17) was reported as a blocked port,
+  sending the reader to a ufw config that was already correct. The probe now
+  compares the renderer's stream-request counter across the Play: if anything
+  arrived from the speaker in that window, the port is demonstrably open and
+  nothing is reported. A speaker that genuinely never connects is reported
+  exactly as before.
+- Every request that reaches the HTTP server counts, including one answered
+  409, because reaching us at all is the whole question being asked.
+
 ## 0.1.13 — 2026-09-08
 
 A newly added Sonos Move was selectable in the sound menu and silent. It was

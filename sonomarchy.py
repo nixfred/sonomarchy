@@ -682,12 +682,29 @@ def _reply_route(host, peer):
     return None
 
 
-async def _firewall_probe(renderer):
+async def _firewall_probe(renderer, fetches_at_play=None):
+    """Blame the firewall only when the speaker never reached us at all.
+
+    `is_playing` alone is not that test. A speaker that fetches the stream and
+    then drops it -- firmware refusing our response (FIX 17) is the case that
+    exposed this -- leaves is_playing False, and the probe then reported a
+    firewall while the speaker's own GET sat two lines above it in the log.
+    That sends the reader to ufw, which was already correct, and it cost real
+    time on 2026-09-08. Comparing the request counter across the Play answers
+    the actual question: did anything arrive from the speaker?
+    """
     await asyncio.sleep(FIREWALL_GRACE)
     try:
         if renderer.nullsink is None:            # renderer closed meanwhile
             return
         if renderer.stream_sessions.is_playing:  # the speaker fetched it
+            return
+        fetches = getattr(renderer, '_sonomarchy_fetches', 0)
+        if fetches_at_play is not None and fetches != fetches_at_play:
+            # It reached us and then stopped; whatever is wrong, it is not a
+            # blocked port. The drop is reported at WARNING where it happens.
+            logger.debug(f'{renderer.name}: fetched the stream after Play and '
+                         f'then stopped; not reporting a firewall')
             return
         port = renderer.control_point.port
         host = renderer.root_device.local_ipaddress
@@ -725,7 +742,8 @@ async def _play(self, *args, **kwargs):
     result = await _orig_play(self, *args, **kwargs)
     _mark_started(self)
     try:
-        _keep(asyncio.get_running_loop().create_task(_firewall_probe(self)))
+        _keep(asyncio.get_running_loop().create_task(
+            _firewall_probe(self, getattr(self, '_sonomarchy_fetches', 0))))
     except Exception:
         pass
     return result
@@ -1900,6 +1918,12 @@ async def _client_connected(self, reader, writer):
             if handler.command != 'GET':
                 handler.send_error(H.HTTPStatus.METHOD_NOT_ALLOWED)
                 break
+
+            # The speaker reached us. Counted before the takeover branch on
+            # purpose: even a request we answer 409 proves the network path
+            # works, which is the only question FIX 8's probe is asking.
+            renderer._sonomarchy_fetches = (
+                getattr(renderer, '_sonomarchy_fetches', 0) + 1)
 
             if renderer.stream_sessions.is_playing:
                 if _should_takeover(renderer.name, time.monotonic()):

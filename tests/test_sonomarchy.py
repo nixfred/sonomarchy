@@ -1691,3 +1691,67 @@ class ChunkedFallback(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FirewallProbeFalsePositive(unittest.TestCase):
+    """FIX 8 must not blame a firewall for a speaker that did reach us.
+
+    The Move fetched the stream every time and reset it 2.4 s later, so
+    is_playing was False when the probe ran and it reported a blocked port --
+    pointing at ufw, which was already correctly configured.
+    """
+
+    class Sessions:
+        is_playing = False
+
+    class Device:
+        local_ipaddress = '10.0.0.22'
+        peer_ipaddress = '10.0.0.46'
+
+    class ControlPoint:
+        port = 8080
+
+    def renderer(self, fetches=0):
+        r = type('Renderer', (), {})()
+        r.name = 'Move - Sonos Move Media Renderer'
+        r.description = 'Move (Sonos Move)'
+        r.nullsink = object()
+        r.stream_sessions = self.Sessions()
+        r.root_device = self.Device()
+        r.control_point = self.ControlPoint()
+        r._sonomarchy_fetches = fetches
+        return r
+
+    def run_probe(self, module, renderer, fetches_at_play):
+        emitted = []
+        module.emit = lambda event, **kw: emitted.append((event, kw))
+        module.FIREWALL_GRACE = 0
+        module._reply_route = lambda host, peer: 'wlp2s0'
+        asyncio.run(module._firewall_probe(renderer, fetches_at_play))
+        return emitted
+
+    def test_a_speaker_that_fetched_is_not_blamed_on_the_firewall(self):
+        m = load()
+        # Told to Play at 3 requests, answered one more before it dropped.
+        r = self.renderer(fetches=4)
+        self.assertEqual(self.run_probe(m, r, 3), [])
+
+    def test_a_speaker_that_never_reached_us_still_reports_it(self):
+        m = load()
+        r = self.renderer(fetches=3)
+        events = self.run_probe(m, r, 3)
+        self.assertEqual([e for e, _ in events], ['firewall_suspected'])
+
+    def test_an_unknown_baseline_keeps_the_old_behaviour(self):
+        # Nothing should call it this way, but a None baseline must not turn
+        # the check into a silent no-op that hides a real firewall.
+        m = load()
+        r = self.renderer(fetches=9)
+        events = self.run_probe(m, r, None)
+        self.assertEqual([e for e, _ in events], ['firewall_suspected'])
+
+    def test_a_playing_speaker_is_never_reported(self):
+        m = load()
+        r = self.renderer(fetches=3)
+        r.stream_sessions.is_playing = True
+        self.assertEqual(self.run_probe(m, r, 3), [])
