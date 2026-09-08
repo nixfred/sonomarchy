@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.12 — 2026-09-08
+
+0.1.11 did not load. It added a second `Component.onDestruction` to a file that
+already had one, which is a compile error — `Property value set multiple
+times` — so the shell logged `service plugin load failed` and every Sonos
+output disappeared until it was fixed. The validator was green the whole time.
+
+- Fixed: the duplicate handler. The teardown warning now lives in the existing
+  `Component.onDestruction`, next to the `expectedStop` it already set.
+- Added: **the validator now compiles the QML.** `qmlcachegen` is the real QML
+  compiler and fails on exactly the error that shipped; `qmllint` returns 0 for
+  it, so it can only ever be the style pass. Proven against a copy of the
+  broken file before being trusted.
+- Fixed: both Qt tools were looked up with a bare `command -v`, and Arch keeps
+  them in `/usr/lib/qt6/`, which is not on `PATH`. The `qmllint` step had
+  therefore been silently skipped since the day it was added.
+- Verified live this time, rather than by inspection: the backend was SIGKILLed
+  and the journal answered
+  `backend stopped unexpectedly (killed by a signal); restarting in 2000 ms,
+  attempt 1`, followed by the resume sweep putting the stream back.
+
 ## 0.1.11 — 2026-09-08
 
 Diagnosis only: no behaviour change. Answering "is the music skipping a bug or

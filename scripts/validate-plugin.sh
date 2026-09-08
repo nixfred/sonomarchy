@@ -53,8 +53,42 @@ grep -q "^$(jq -r .version manifest.json)" <(grep -oE '^## [0-9]+\.[0-9]+\.[0-9]
   || fail "CHANGELOG.md has no entry for version $(jq -r .version manifest.json)"
 ok "changelog covers $(jq -r .version manifest.json)"
 
-if command -v qmllint >/dev/null 2>&1; then
-  qmllint Service.qml >/dev/null 2>&1 && ok "qmllint Service.qml" || printf 'warn qmllint reported issues (often import resolution; check manually)\n'
+# Qt ships these in a libexec-ish directory that is not on PATH on Arch, so a
+# bare `command -v` silently skipped both checks here for their whole life.
+find_qt_tool() {
+  local name="$1" candidate
+  for candidate in "$(command -v "$name" 2>/dev/null || true)" \
+                   "/usr/lib/qt6/$name" "/usr/lib64/qt6/$name" \
+                   "/usr/lib/qt6/bin/$name" "/usr/lib64/qt6/bin/$name"; do
+    [[ -n "$candidate" && -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+if qmllint="$(find_qt_tool qmllint)"; then
+  "$qmllint" Service.qml >/dev/null 2>&1 && ok "qmllint Service.qml" || printf 'warn qmllint reported issues (often import resolution; check manually)\n'
+fi
+
+# qmllint is advisory and NOT enough on its own: it exits 0 on "Property value
+# set multiple times", which is a load-time failure that takes the whole
+# service out -- the shell logs "service plugin load failed" and every Sonos
+# output disappears. Shipped exactly that on 2026-09-08 (two
+# Component.onDestruction blocks in one file) with the validator green, and
+# only noticed because the zones vanished. qmlcachegen runs the real QML
+# compiler, so it is the gate; qmllint stays as the style pass.
+if qmlcachegen="$(find_qt_tool qmlcachegen)"; then
+  scratch="$(mktemp -d)"
+  trap 'rm -rf "$scratch"' EXIT
+  for qml in *.qml; do
+    [[ -e "$qml" ]] || continue
+    # --resource-path is required or the compiler refuses the file outright,
+    # and its value only has to be a plausible qrc path.
+    "$qmlcachegen" --resource-path "/$qml" -o "$scratch/${qml%.qml}.cpp" "$qml" \
+      || fail "$qml does not compile (the shell would refuse to load it)"
+    ok "$qml compiles"
+  done
+else
+  printf 'warn qmlcachegen not found; QML is unchecked by the compiler\n'
 fi
 
 echo "all checks passed"

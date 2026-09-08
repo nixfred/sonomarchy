@@ -216,9 +216,12 @@ Item {
 
     onExited: function(exitCode, exitStatus) {
       root.zones = ({})
-      // exitStatus is QProcess.CrashExit when a signal ended it, which is the
-      // normal shape of the backend's own deliberate exit (it SIGTERMs itself)
-      // as well as of a real crash. Only restartReason separates the two.
+      // exitStatus is QProcess.CrashExit (1) when a signal ended it, which is
+      // the shape of the backend's own deliberate exit (it SIGTERMs itself) as
+      // well as of a real crash; only restartReason separates those two.
+      // qmllint warns that QProcess::ExitStatus does not resolve for AOT
+      // compilation, but the interpreter passes it fine -- verified live on
+      // 2026-09-08 by SIGKILLing the backend and reading the journal line.
       var died = exitStatus === 1 ? "killed by a signal" : "exit code " + exitCode
       if (root.expectedStop) {
         console.log("Sonomarchy: backend stopped on request (" + died + ")")
@@ -260,16 +263,6 @@ Item {
     id: osd
   }
 
-  // Any local plugin changing on disk makes the shell unload EVERY plugin
-  // service, this one included; the backend dies with the Process object and
-  // onExited never runs. Without this line that teardown is invisible and the
-  // resulting gap in the music looks like a network fault. It is the loudest
-  // thing Sonomarchy can do about it from inside the plugin.
-  Component.onDestruction: {
-    if (backend.running) console.warn("Sonomarchy: the shell is unloading this plugin's"
-      + " service; the backend and any stream it is running go with it")
-  }
-
   Timer {
     id: restartTimer
     repeat: false
@@ -306,6 +299,13 @@ Item {
 
   Component.onCompleted: backend.running = true
   Component.onDestruction: {
+    // Any local plugin changing on disk makes the shell unload EVERY plugin
+    // service, this one included, so editing an unrelated plugin stops the
+    // music for as long as the replacement needs to rediscover the household.
+    // That is the shell's design, not a fault -- but it is what made the
+    // 2026-09-08 skipping look like a network problem, so say it out loud.
+    if (backend.running) console.warn("Sonomarchy: the shell is unloading this"
+      + " service; the backend and any stream it is running stop with it")
     expectedStop = true
     backend.running = false
   }
