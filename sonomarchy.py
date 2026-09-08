@@ -1959,6 +1959,38 @@ async def _client_connected(self, reader, writer):
                 pass
 
 
+# ===========================================================================
+# FIX 18 - ask parec for a small buffer, or the audio arrives in lumps
+# ===========================================================================
+# `parec` with no latency request gets whatever the server thinks is generous:
+# measured here, a 88200-frame quantum at 44100 Hz -- a two second buffer. The
+# capture then reaches the encoder in ~0.37 s lumps after an initial 2 s stall,
+# and delivers only ~120 KB/s of the 176 KB/s the stream needs. A speaker with
+# a shallow jitter buffer plays that as a stutter roughly once a second, which
+# is exactly how a new Sonos Move sounded on 2026-09-08 while every session
+# metric said the stream was healthy: no drops, no restarts, no xruns.
+#
+# Measured over 6 s on the same monitor source:
+#     default            724992 bytes, 12 stalls > 50 ms (~0.37 s apart)
+#     --latency-msec=50 1052672 bytes, steady 53 ms cadence
+# 175 KB/s is real time; the default was not keeping up at all.
+PAREC_LATENCY_MSEC = 50
+
+_orig_run_parec = _http_server.StreamProcesses.run_parec
+
+
+async def _run_parec(self, encoder, parec_cmd, stdout=None):
+    """Add a latency request to the parec argv unless one is already there."""
+    if not any(str(arg).startswith('--latency') for arg in parec_cmd):
+        # A new list: upstream extends the one it is given, and mutating the
+        # caller's would double the flag on a restarted track.
+        parec_cmd = list(parec_cmd) + [f'--latency-msec={PAREC_LATENCY_MSEC}']
+    return await _orig_run_parec(self, encoder, parec_cmd, stdout)
+
+
+_http_server.StreamProcesses.run_parec = _run_parec
+
+
 _http_server.HTTPServer.client_connected = _client_connected
 
 

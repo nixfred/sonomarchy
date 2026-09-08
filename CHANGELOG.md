@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.15 — 2026-09-08
+
+The Move played, but it stuttered about once a second. Every session-level
+metric said the stream was perfectly healthy — no drops, no restarts, no
+xruns, no packet loss — because none of them look inside a running stream.
+
+- Fixed: **`parec` was given no latency request, so it got a two second
+  buffer.** Measured on the live monitor source: an 88200-frame quantum at
+  44100 Hz, an initial 2 s stall, then audio arriving in ~0.37 s lumps at
+  ~120 KB/s against the 176 KB/s the stream needs. A speaker with a shallow
+  jitter buffer plays that as a stutter roughly once a second. The argv now
+  carries `--latency-msec=50` unless one was already requested, which
+  measured 1052672 bytes over 6 s (175 KB/s — real time) in a steady 53 ms
+  cadence.
+
+Measured, not guessed:
+
+    default            724992 bytes / 6 s, 12 stalls > 50 ms
+    --latency-msec=50 1052672 bytes / 6 s, no stalls
+
 ## 0.1.14 — 2026-09-08
 
 The Move was fixed in 0.1.13, but the log kept insisting the problem was a

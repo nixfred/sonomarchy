@@ -1755,3 +1755,46 @@ class FirewallProbeFalsePositive(unittest.TestCase):
         r = self.renderer(fetches=3)
         r.stream_sessions.is_playing = True
         self.assertEqual(self.run_probe(m, r, 3), [])
+
+
+class ParecLatency(unittest.TestCase):
+    """FIX 18: an unbounded parec buffer starves the speaker.
+
+    With no latency request the capture arrived in ~0.37 s lumps at ~120 KB/s
+    against the 176 KB/s the stream needs, which a Sonos Move played as a
+    stutter about once a second.
+    """
+
+    def capture_argv(self, module, parec_cmd):
+        seen = {}
+
+        async def fake_run_parec(self, encoder, cmd, stdout=None):
+            seen['cmd'] = list(cmd)
+
+        module._orig_run_parec = fake_run_parec
+        asyncio.run(module._run_parec(object(), object(), parec_cmd))
+        return seen['cmd']
+
+    def test_a_latency_is_requested(self):
+        m = load()
+        argv = self.capture_argv(m, ['/usr/bin/parec'])
+        self.assertIn('--latency-msec=%d' % m.PAREC_LATENCY_MSEC, argv)
+
+    def test_the_latency_is_short_enough_to_matter(self):
+        # The whole point is a buffer far below the two seconds measured.
+        m = load()
+        self.assertLessEqual(m.PAREC_LATENCY_MSEC, 200)
+
+    def test_an_explicit_latency_is_left_alone(self):
+        m = load()
+        argv = self.capture_argv(m, ['/usr/bin/parec', '--latency-msec=200'])
+        self.assertEqual([a for a in argv if a.startswith('--latency')],
+                         ['--latency-msec=200'])
+
+    def test_the_callers_argv_is_not_mutated(self):
+        # Upstream extends the list it is handed; mutating it here would add
+        # the flag again on every restarted track.
+        m = load()
+        cmd = ['/usr/bin/parec']
+        self.capture_argv(m, cmd)
+        self.assertEqual(cmd, ['/usr/bin/parec'])
