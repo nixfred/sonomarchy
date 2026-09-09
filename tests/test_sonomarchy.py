@@ -1201,8 +1201,20 @@ class FirewallRuleHint(unittest.TestCase):
         m = load()
         rules = m._firewall_rules('ufw', '10.0.0.0/24', 8083, 8081)
         self.assertEqual(len(rules), 2)
-        self.assertIn('proto tcp from 10.0.0.0/24 to any port 8083', rules[0])
+        # The wrapper picks any port in the range, so the rule must cover the
+        # range: a rule for 8083 alone stops matching the day 8083 is busy.
+        self.assertIn('proto tcp from 10.0.0.0/24 to any port 8080:8089', rules[0])
         self.assertIn('proto udp from 10.0.0.0/24 to any port 8081', rules[1])
+
+    def test_a_pinned_port_outside_the_range_is_named_exactly(self):
+        m = load()
+        rules = m._firewall_rules('ufw', '10.0.0.0/24', 9000, 8081)
+        self.assertIn('to any port 9000 ', rules[0])
+
+    def test_firewalld_range_uses_a_dash(self):
+        m = load()
+        rules = m._firewall_rules('firewalld', '192.168.1.0/24', 8081, 8081)
+        self.assertIn('port port=8080-8089 protocol=tcp', rules[0])
 
     def test_firewalld_gets_firewalld_syntax(self):
         m = load()
@@ -1738,6 +1750,23 @@ class FirewallProbeFalsePositive(unittest.TestCase):
         r = self.renderer(fetches=3)
         events = self.run_probe(m, r, 3)
         self.assertEqual([e for e, _ in events], ['firewall_suspected'])
+
+    def test_the_lan_interface_is_not_called_a_vpn(self):
+        # run_probe routes the reply out wlp2s0; that is the LAN, and the
+        # shell turns any reply_dev into "a VPN (<dev>) is claiming your LAN".
+        m = load()
+        events = self.run_probe(m, self.renderer(fetches=3), 3)
+        self.assertIsNone(events[0][1]['reply_dev'])
+
+    def test_a_tunnel_interface_is_named(self):
+        m = load()
+        r = self.renderer(fetches=3)
+        emitted = []
+        m.emit = lambda event, **kw: emitted.append((event, kw))
+        m.FIREWALL_GRACE = 0
+        m._reply_route = lambda host, peer: 'tailscale0'
+        asyncio.run(m._firewall_probe(r, 3))
+        self.assertEqual(emitted[0][1]['reply_dev'], 'tailscale0')
 
     def test_an_unknown_baseline_keeps_the_old_behaviour(self):
         # Nothing should call it this way, but a None baseline must not turn

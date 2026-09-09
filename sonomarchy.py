@@ -121,7 +121,7 @@ from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '1.5.1'   # kept equal to manifest.json by the validator
+VERSION = '1.5.2'   # kept equal to manifest.json by the validator
 
 logger = logging.getLogger('sonomarchy')
 
@@ -838,8 +838,11 @@ async def _firewall_probe(renderer, fetches_at_play=None):
         logger.warning(f'{renderer.name}: told to Play {FIREWALL_GRACE}s ago '
                        f'and never fetched the stream from TCP port {port}; '
                        f'{cause}')
+        # reply_dev is the shell's cue to say "a VPN is claiming your LAN";
+        # sending the plain LAN interface here made it say that about wlp2s0.
+        tunnel = dev if (dev and dev.startswith(_TUNNEL_PREFIXES)) else None
         emit('firewall_suspected', port=port, zone=renderer.description,
-             host=host, reply_dev=dev, subnet=_lan_cidr(host))
+             host=host, reply_dev=tunnel, subnet=_lan_cidr(host))
     except Exception as e:
         logger.debug(f'firewall probe skipped: {e!r}')
 
@@ -912,6 +915,22 @@ def _lan_cidr(host):
     return None
 
 
+# Mirrors HTTP_PORT_RANGE in sonomarchy-backend; the validator keeps them equal.
+# The wrapper takes the first free port in this range, so a firewall rule for
+# the port in use today is a rule that silently stops matching the day
+# something else sits on that port first (2026-09-09: signal-cli on 8080).
+STREAM_PORT_RANGE = (8080, 8089)
+
+
+def _tcp_port_spec(tcp_port, sep):
+    """`8080:8089` (ufw) / `8080-8089` (firewalld) when the port is one the
+    wrapper picks from; the single port when the user pinned one elsewhere."""
+    lo, hi = STREAM_PORT_RANGE
+    if lo <= int(tcp_port) <= hi:
+        return f'{lo}{sep}{hi}'
+    return str(tcp_port)
+
+
 def _firewall_rules(firewall, cidr, tcp_port, udp_port):
     """The exact commands this machine needs, or [] if we cannot be exact.
 
@@ -923,7 +942,7 @@ def _firewall_rules(firewall, cidr, tcp_port, udp_port):
         return []
     if firewall == 'firewalld':
         rules = [f"firewall-cmd --permanent --add-rich-rule='rule family=ipv4"
-                 f" source address={cidr} port port={tcp_port}"
+                 f" source address={cidr} port port={_tcp_port_spec(tcp_port, '-')}"
                  f" protocol=tcp accept'"]
         if udp_port:
             rules.append(f"firewall-cmd --permanent --add-rich-rule='rule"
@@ -934,8 +953,8 @@ def _firewall_rules(firewall, cidr, tcp_port, udp_port):
     # Everything else gets ufw syntax: it is what the README documents, and
     # an nftables user reading a ufw line still learns the port, protocol and
     # source range they need, which is the part that is machine-specific.
-    rules = [f'ufw allow proto tcp from {cidr} to any port {tcp_port}'
-             f" comment 'Sonomarchy stream'"]
+    rules = [f'ufw allow proto tcp from {cidr} to any port '
+             f"{_tcp_port_spec(tcp_port, ':')} comment 'Sonomarchy stream'"]
     if udp_port:
         rules.append(f'ufw allow proto udp from {cidr} to any port'
                      f" {udp_port} comment 'Sonomarchy discovery'")

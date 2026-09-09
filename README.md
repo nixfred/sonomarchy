@@ -50,7 +50,7 @@ The **speaker pulls audio from your computer**. With a default-deny firewall
 no error. Allow the two ports from your LAN — as root, adjusting the subnet:
 
 ```bash
-ufw allow proto tcp from 192.168.1.0/24 to any port 8080 comment 'Sonomarchy stream'
+ufw allow proto tcp from 192.168.1.0/24 to any port 8080:8089 comment 'Sonomarchy stream'
 ufw allow proto udp from 192.168.1.0/24 to any port 8081 comment 'Sonomarchy discovery'
 ```
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.2 — 2026-09-09
+
+Office was selectable and silent, and this time the firewall warning was
+right: the backend had come up on port 8081 and the only rule was for 8080.
+
+- Fixed: **the free-port probe was stricter than the real bind.** The wrapper
+  probed `0.0.0.0`, so another program holding `127.0.0.1:8080` (loopback
+  only — `signal-cli` here) made 8080 look busy and the backend hopped to 8081,
+  outside the firewall rule. The backend actually binds the LAN address of each
+  default-route interface, so the probe now binds exactly those addresses,
+  falling back to the wildcard only when no address has resolved yet.
+- Changed: **the firewall hint and README name the whole 8080–8089 range** the
+  wrapper picks from, not the port in use today. A rule for today's port is a
+  rule that silently stops matching the day something else takes it first. A
+  port pinned with `SONOMARCHY_HTTP_PORT` outside the range is still named
+  exactly. The validator fails if the wrapper's range and the backend's copy
+  ever disagree.
+- Fixed: **"a VPN (wlp2s0) is claiming your LAN."** The probe reported the
+  reply interface unconditionally and the shell turns any value into the VPN
+  message; it now reports it only for tunnel-class devices, so the LAN
+  interface gets the firewall wording it deserves.
+
 ## 1.5.1 — 2026-09-08
 
 Still pulsing on the Move, with the capture clean and the link unchanged. The

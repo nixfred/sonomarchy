@@ -128,16 +128,33 @@ if command -v ip >/dev/null 2>&1; then
   nics="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, -)"
 fi
 
+# The backend binds the LAN address of each default-route interface, not the
+# wildcard, so that is what to probe. Probing 0.0.0.0 is stricter than the real
+# bind: on 2026-09-09 signal-cli held 127.0.0.1:8080 (loopback only), the
+# wildcard probe called 8080 busy, the backend moved to 8081, and the only
+# firewall rule was for 8080 -- selectable zone, silent speaker. With no
+# resolvable address (no default route yet) fall back to the wildcard.
+bind_addresses() {
+  local nic addrs=""
+  for nic in ${nics//,/ }; do
+    addrs+=" $(ip -4 -o addr show dev "$nic" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  done
+  addrs="$(printf '%s\n' $addrs | grep -E '^[0-9.]+$' | sort -u | paste -sd' ' -)"
+  printf '%s' "${addrs:-0.0.0.0}"
+}
+
 port_is_free() {
-  "$PYTHON_BIN" - "$1" <<'PY' 2>/dev/null
+  "$PYTHON_BIN" - "$1" $(bind_addresses) <<'PY' 2>/dev/null
 import socket, sys
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    s.bind(("0.0.0.0", int(sys.argv[1])))
-except OSError:
-    raise SystemExit(1)
-finally:
-    s.close()
+port, addrs = int(sys.argv[1]), sys.argv[2:]
+for addr in addrs:
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((addr, port))
+    except OSError:
+        raise SystemExit(1)
+    finally:
+        s.close()
 PY
 }
 

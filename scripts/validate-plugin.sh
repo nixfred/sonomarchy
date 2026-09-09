@@ -60,6 +60,14 @@ py_version="$(grep -oE "^VERSION = '[^']+'" sonomarchy.py | sed "s/.*'\(.*\)'/\1
   || fail "sonomarchy.py VERSION ($py_version) != manifest.json ($(jq -r .version manifest.json))"
 ok "backend VERSION matches manifest"
 
+# The firewall hint names the range the wrapper picks from; if the two drift
+# the hint opens the wrong ports, which is the failure it exists to prevent.
+wrapper_range="$(grep -oE '^HTTP_PORT_RANGE=\([0-9 ]+\)' sonomarchy-backend | grep -oE '[0-9]+' | sed -n '1p;$p' | paste -sd- -)"
+backend_range="$(grep -oE '^STREAM_PORT_RANGE = \([0-9]+, [0-9]+\)' sonomarchy.py | grep -oE '[0-9]+' | paste -sd- -)"
+[[ -n "$wrapper_range" && "$wrapper_range" == "$backend_range" ]] \
+  || fail "port range differs: sonomarchy-backend HTTP_PORT_RANGE ($wrapper_range) vs sonomarchy.py STREAM_PORT_RANGE ($backend_range)"
+ok "stream port range agrees ($backend_range)"
+
 # Qt ships these in a libexec-ish directory that is not on PATH on Arch, so a
 # bare `command -v` silently skipped both checks here for their whole life.
 find_qt_tool() {
