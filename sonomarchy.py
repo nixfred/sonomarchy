@@ -121,7 +121,7 @@ from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '1.5.2'   # kept equal to manifest.json by the validator
+VERSION = '1.5.3'   # kept equal to manifest.json by the validator
 
 logger = logging.getLogger('sonomarchy')
 
@@ -2580,8 +2580,36 @@ def _sweep_unadopted_sinks():
         logger.debug(f'unadopted sink sweep skipped: {e!r}')
 
 
+def _die_with_the_shell():
+    """Ask the kernel for SIGTERM when the shell that started us is gone.
+
+    The service stops its backend when it unloads, but a shell that dies hard
+    (the ``omarchy restart shell`` kill, a crash) never gets to. The backend
+    it leaves behind keeps the instance lock and the speakers for as long as
+    it lives; on 2026-09-09 one outlived nine shell restarts and every new
+    shell failed with "still running after 20 s". PR_SET_PDEATHSIG (Linux
+    only, the only platform Omarchy runs on) closes that gap: the shell going
+    away becomes the same clean SIGTERM shutdown an unload sends.
+    """
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        pr_set_pdeathsig = 1
+        if libc.prctl(pr_set_pdeathsig, int(signal.SIGTERM), 0, 0, 0) != 0:
+            return
+    except (OSError, AttributeError):
+        return
+    # The signal is only armed for a parent that dies AFTER the call; one
+    # that died in between would leave us orphaned exactly as before.
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
+    _die_with_the_shell()
     emit('starting', version=VERSION)
     # FIX 15: sinks are adopted, not recreated, so they must NOT be cleared
     # here -- that would throw away the ones playback is sitting on. Whatever

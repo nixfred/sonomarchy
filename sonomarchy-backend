@@ -65,10 +65,60 @@ mkdir -p "$DATA_DIR"
 # stale-sink cleanup two starts could otherwise race through.
 # A dry run resolves ports and interfaces next to a running backend, so it
 # must not compete for the instance lock or object to the running instance.
+#
+# The holder writes its pid into the lock file (exec keeps the pid, so it is
+# the Python backend's). /proc/locks is no use for that: `flock 8` is a child
+# process that takes the lock and exits, so the pid recorded there is dead.
+#
+# A holder whose shell is gone is an orphan, not a competitor. The shell is
+# meant to take its backend down with it, but a shell that dies hard (the
+# `omarchy restart shell` kill, a crash) cannot, and the backend it leaves
+# behind keeps the lock -- and the speakers -- for as long as it lives. On
+# 2026-09-09 one survived nine shell restarts and every new shell posted
+# "still running after 20 s" twice, then gave up. An orphan is stopped here
+# and its lock taken; a backend under a LIVE shell (a second shell, a reload
+# still shutting down) is still waited for and never touched.
+lock_holder_pid() {
+  local pid
+  pid="$(head -n 1 "$INSTANCE_LOCK" 2>/dev/null | tr -cd '0-9')"
+  [[ -n "$pid" && "$pid" != "$$" && -d "/proc/$pid" ]] || return 1
+  # Only ever act on a backend of ours: the pid could have been recycled.
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'sonomarchy\.py' || return 1
+  printf '%s\n' "$pid"
+}
+pid_is_orphan() {
+  local ppid comm
+  ppid="$(awk '/^PPid:/ { print $2 }' "/proc/$1/status" 2>/dev/null)" || return 1
+  [[ -n "$ppid" ]] || return 1
+  [[ "$ppid" -gt 1 ]] || return 0
+  comm="$(cat "/proc/$ppid/comm" 2>/dev/null)" || return 0
+  # Reparented to the session's reaper (systemd --user on Omarchy, init
+  # elsewhere): the shell that started it is gone.
+  case "$comm" in systemd|init) return 0 ;; esac
+  return 1
+}
+
 if [[ -z "${SONOMARCHY_DRY_RUN:-}" ]]; then
-  exec 8>"$INSTANCE_LOCK"
-  flock -w 20 8 \
-    || setup_error "Another Sonomarchy backend is still running after 20 s."
+  # Append mode: opening must not truncate the holder's pid out from under it.
+  exec 8>>"$INSTANCE_LOCK"
+  if ! flock -n 8; then
+    holder="$(lock_holder_pid || true)"
+    if [[ -n "$holder" ]] && pid_is_orphan "$holder"; then
+      printf 'sonomarchy-backend: stopping backend %s, whose shell is gone, to take over its lock\n' "$holder" >&2
+      kill -TERM "$holder" 2>/dev/null || true
+      for _ in $(seq 1 100); do
+        flock -n 8 && break
+        [[ -d "/proc/$holder" ]] || break
+        sleep 0.1
+      done
+      if ! flock -n 8; then
+        kill -KILL "$holder" 2>/dev/null || true
+      fi
+    fi
+    flock -w 20 8 \
+      || setup_error "Another Sonomarchy backend is still running after 20 s."
+  fi
+  printf '%d\n' "$$" > "$INSTANCE_LOCK"
 
   # pa-dlna refuses to start twice. A pa-dlna the user runs by hand (or left
   # behind as a user service from a manual install) would make every backend

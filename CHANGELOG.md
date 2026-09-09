@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.3 — 2026-09-09
+
+"Sonomarchy can't start: Another Sonomarchy backend is still running after
+20 s." flashed twice on every shell restart, and there were nine of those in
+an afternoon of plugin deploys. The backend it named had been started by a
+shell that died at 13:17 and was still streaming to the Living Room at 14:30.
+
+- Fixed: **a backend outlives a shell that dies hard.** The service stops its
+  backend when it unloads, but the `omarchy restart shell` kill never lets it,
+  so the backend kept the instance lock and every new shell's backend waited
+  20 s, failed, retried once, failed again and gave up. The backend now asks
+  the kernel for SIGTERM the moment its shell is gone (PR_SET_PDEATHSIG), the
+  same clean shutdown an unload sends.
+- Fixed: **an orphan already holding the lock is taken over, not waited for.**
+  The wrapper records the backend's pid in the lock file and, when the lock is
+  busy, checks the holder: a Sonomarchy backend whose parent is the session's
+  reaper rather than a shell is stopped and its lock taken within a second. A
+  backend under a live shell (a second shell, a reload still shutting down) is
+  still waited for and never touched. Opening the lock file no longer
+  truncates it, so the holder's pid survives a second start.
+
 ## 1.5.2 — 2026-09-09
 
 Office was selectable and silent, and this time the firewall warning was
