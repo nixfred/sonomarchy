@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.4 — 2026-09-10
+
+The 20-second OSD from 1.5.3 was still appearing on vic, three times today.
+1.5.3's takeover was right about what an orphan is; it just could not find
+this one.
+
+- Fixed: **the takeover only knew a lock holder by the pid it wrote into the
+  lock file.** A backend started by a wrapper older than 1.5.3 never wrote
+  one — the holder here had been running since Sep 6 — so the file was empty,
+  nothing was found, and every new shell waited 20 s and posted the error.
+  When the file has no usable pid, the wrapper now finds whoever actually has
+  the lock file open in `/proc`, and applies the same orphan test to it.
+- Fixed: **the backend's own start-up check treated only pid 1 as orphaned.**
+  On a systemd user session the reaper is `systemd --user`, a child subreaper,
+  so that check never fired on Omarchy. A parent whose comm is `systemd` or
+  `init` now counts.
+- Added: tests that spawn a real reparented fake holder with an empty pid file
+  and prove it is found and judged an orphan, that a holder under a live parent
+  is left alone, and that a pid which is not our backend is never acted on.
+
 ## 1.5.3 — 2026-09-09
 
 "Sonomarchy can't start: Another Sonomarchy backend is still running after

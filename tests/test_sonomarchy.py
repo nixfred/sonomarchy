@@ -1911,5 +1911,109 @@ class SilencePrime(unittest.TestCase):
         m = load()
         self.assertEqual(m._tune_stream_socket(None), [])
 
+
+class OrphanedAtStart(unittest.TestCase):
+    """The backend must recognise the session reaper, not just pid 1."""
+
+    def test_pid_1_is_an_orphan(self):
+        self.assertTrue(load()._orphaned_at_start(1))
+
+    def test_the_user_session_reaper_is_an_orphan(self):
+        # `systemd --user` is a child subreaper: on Omarchy this, not pid 1,
+        # is what a backend is reparented to when its shell dies.
+        self.assertTrue(load()._orphaned_at_start(792, comm='systemd'))
+
+    def test_a_live_shell_is_not(self):
+        self.assertFalse(load()._orphaned_at_start(4242, comm='quickshell'))
+
+    def test_the_real_parent_of_this_test_is_not_an_orphan(self):
+        # The runner's parent is a shell or a python, never a reaper; this
+        # exercises the /proc read for real.
+        self.assertFalse(load()._orphaned_at_start(os.getppid()))
+
+
+class OrphanLockTakeover(unittest.TestCase):
+    """The wrapper's takeover must find a holder that never wrote its pid.
+
+    A backend started by a wrapper older than 1.5.3 (the 2026-09-06 zombie on
+    vic) holds the instance lock with an EMPTY pid file. Reading the pid out
+    of the file finds nothing, so the takeover never ran and every shell
+    posted "still running after 20 s". The fallback is whoever has the lock
+    file open in /proc.
+    """
+
+    def setUp(self):
+        import subprocess, tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.lock = os.path.join(self.tmp, 'instance.lock')
+        open(self.lock, 'w').close()
+        src = open(os.path.join(os.path.dirname(HERE), 'sonomarchy-backend')).read()
+        start = src.index('is_our_backend() {')
+        end = src.index('if [[ -z "${SONOMARCHY_DRY_RUN:-}" ]]; then')
+        self.functions = src[start:end]
+        self.holders = []
+
+    def tearDown(self):
+        import shutil, signal as sig
+        for pid in self.holders:
+            try: os.kill(pid, sig.SIGKILL)
+            except ProcessLookupError: pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def spawn_holder(self, reparent):
+        """A process that looks like our backend and holds the lock open."""
+        import subprocess, time
+        script = ('exec 8>>"$1"; echo $$ > "$2"; '
+                  'exec -a "python sonomarchy.py --port 8080" sleep 60')
+        pidfile = os.path.join(self.tmp, 'holder.pid')
+        if reparent:
+            # setsid -f forks and the launcher exits at once, so the holder is
+            # reparented to the session reaper -- exactly the zombie's shape.
+            subprocess.run(['setsid', '-f', 'bash', '-c', script, '_', self.lock, pidfile], check=True)
+        else:
+            self.proc = subprocess.Popen(['bash', '-c', script, '_', self.lock, pidfile])
+        for _ in range(50):
+            if os.path.exists(pidfile) and open(pidfile).read().strip():
+                break
+            time.sleep(0.05)
+        pid = int(open(pidfile).read().strip())
+        self.holders.append(pid)
+        time.sleep(0.2)                          # let exec -a land
+        return pid
+
+    def bash(self, snippet):
+        import subprocess
+        return subprocess.run(
+            ['bash', '-c', f'INSTANCE_LOCK="{self.lock}"\n{self.functions}\n{snippet}'],
+            capture_output=True, text=True)
+
+    def reaper_available(self, pid):
+        ppid = int([l for l in open(f'/proc/{pid}/status') if l.startswith('PPid:')][0].split()[1])
+        comm = open(f'/proc/{ppid}/comm').read().strip() if ppid > 1 else 'init'
+        return ppid == 1 or comm in ('systemd', 'init')
+
+    def test_a_holder_with_no_pid_in_the_file_is_still_found(self):
+        pid = self.spawn_holder(reparent=True)
+        self.assertEqual(open(self.lock).read(), '')   # the zombie's pid file
+        out = self.bash('lock_holder_pid')
+        self.assertEqual(out.stdout.strip(), str(pid), out.stderr)
+
+    def test_a_reparented_holder_is_an_orphan(self):
+        pid = self.spawn_holder(reparent=True)
+        if not self.reaper_available(pid):
+            self.skipTest('this environment reparents to something other than init/systemd')
+        self.assertEqual(self.bash(f'pid_is_orphan {pid} && echo yes || echo no').stdout.strip(), 'yes')
+
+    def test_a_holder_under_a_live_parent_is_left_alone(self):
+        pid = self.spawn_holder(reparent=False)
+        self.assertEqual(self.bash(f'pid_is_orphan {pid} && echo yes || echo no').stdout.strip(), 'no')
+
+    def test_a_pid_that_is_not_our_backend_is_ignored(self):
+        # A recycled pid, or the pid of some other program, must never be
+        # stopped just because it appears in the file.
+        open(self.lock, 'w').write(f'{os.getpid()}\n')      # this test runner
+        out = self.bash('lock_holder_pid; echo "rc=$?"')
+        self.assertIn('rc=1', out.stdout)
+
 if __name__ == '__main__':
     unittest.main()

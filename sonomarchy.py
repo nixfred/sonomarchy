@@ -121,7 +121,7 @@ from pa_dlna import pa_dlna as _pa_dlna
 from pa_dlna import http_server as _http_server
 from pa_dlna import pulseaudio as _pulseaudio
 
-VERSION = '1.5.3'   # kept equal to manifest.json by the validator
+VERSION = '1.5.4'   # kept equal to manifest.json by the validator
 
 logger = logging.getLogger('sonomarchy')
 
@@ -2603,8 +2603,32 @@ def _die_with_the_shell():
         return
     # The signal is only armed for a parent that dies AFTER the call; one
     # that died in between would leave us orphaned exactly as before.
-    if os.getppid() == 1:
+    if _orphaned_at_start(os.getppid()):
         os.kill(os.getpid(), signal.SIGTERM)
+
+
+# What an orphan is reparented to. pid 1 on a plain init; on a systemd user
+# session it is `systemd --user`, a child subreaper, so a check for pid 1
+# alone never fires on Omarchy -- which is how a backend can outlive its shell
+# from before the death signal is armed.
+REAPER_COMMS = ('systemd', 'init')
+
+
+def _parent_comm(ppid):
+    try:
+        with open(f'/proc/{ppid}/comm') as comm:
+            return comm.read().strip()
+    except OSError:
+        return ''
+
+
+def _orphaned_at_start(ppid, comm=None):
+    """True when our parent is init or the session reaper, i.e. not a shell."""
+    if ppid <= 1:
+        return True
+    if comm is None:
+        comm = _parent_comm(ppid)
+    return comm in REAPER_COMMS
 
 
 def main(argv=None):

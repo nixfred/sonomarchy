@@ -78,12 +78,35 @@ mkdir -p "$DATA_DIR"
 # "still running after 20 s" twice, then gave up. An orphan is stopped here
 # and its lock taken; a backend under a LIVE shell (a second shell, a reload
 # still shutting down) is still waited for and never touched.
+is_our_backend() {
+  # Only ever act on a backend of ours: a pid can be recycled, and a wrapper
+  # (bash) sharing the fd is a competitor to wait for, not a holder to stop.
+  [[ -n "$1" && "$1" != "$$" && -d "/proc/$1" ]] || return 1
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q 'sonomarchy\.py'
+}
+lock_holder_by_fd() {
+  # Whoever has the lock file open. Slower than reading the pid out of the
+  # file, so it is the fallback -- but it is the only method that finds a
+  # backend started by a wrapper older than 1.5.3, which never wrote its pid
+  # there. On 2026-09-10 (vic) such a backend from Sep 6 held the lock through
+  # a shell restart; the pid file was empty, the takeover found nothing, and
+  # the shell posted "still running after 20 s" until it was killed by hand.
+  local d p
+  for d in /proc/[0-9]*; do
+    p="${d#/proc/}"
+    [[ "$p" != "$$" ]] || continue
+    ls -l "$d/fd" 2>/dev/null | grep -qF -- " -> $INSTANCE_LOCK" || continue
+    is_our_backend "$p" || continue
+    printf '%s\n' "$p"
+    return 0
+  done
+  return 1
+}
 lock_holder_pid() {
   local pid
   pid="$(head -n 1 "$INSTANCE_LOCK" 2>/dev/null | tr -cd '0-9')"
-  [[ -n "$pid" && "$pid" != "$$" && -d "/proc/$pid" ]] || return 1
-  # Only ever act on a backend of ours: the pid could have been recycled.
-  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'sonomarchy\.py' || return 1
+  is_our_backend "$pid" || pid="$(lock_holder_by_fd || true)"
+  [[ -n "$pid" ]] || return 1
   printf '%s\n' "$pid"
 }
 pid_is_orphan() {
