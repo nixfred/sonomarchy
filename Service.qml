@@ -23,9 +23,10 @@ Item {
   readonly property string moduleName: "io.github.nixfred.sonomarchy"
   readonly property string backendPath: localPath(Qt.resolvedUrl("sonomarchy-backend"))
 
-  property string state: "starting"           // starting | ready | restarting | setup_error
+  property string state: "starting"           // starting | ready | restarting | standby | setup_error
   property string lastError: ""
   property string setupError: ""
+  property string standbyShell: ""            // pid of the other shell that owns the backend
   property var zones: ({})                    // uuid -> { name, sink }
   property int restartAttempt: 0
   property bool expectedStop: false
@@ -55,6 +56,9 @@ Item {
   }
 
   function status() {
+    if (state === "standby")
+      return "Sonomarchy: standby, another Omarchy shell (pid " + standbyShell
+        + ") runs the Sonos backend; this one takes over when it stops"
     var text = "Sonomarchy: " + state + ", " + zoneCount + " zone" + (zoneCount === 1 ? "" : "s")
     if (zoneCount > 0) text += " (" + zoneNames().join(", ") + ")"
     else if (state === "ready") text += " (no Sonos found on this network yet; discovery keeps running)"
@@ -196,6 +200,24 @@ Item {
           console.warn("Sonomarchy:", text)
           return
         }
+        // A second Omarchy shell owns the backend (overlapping shell restarts
+        // leave two). Not a fault: no OSD, no error, just wait for the lock.
+        var standbyMarker = "SONOMARCHY_STANDBY:"
+        if (text.indexOf(standbyMarker) === 0) {
+          root.standbyShell = text.substring(standbyMarker.length).trim().replace(/[^0-9]/g, "")
+          root.state = "standby"
+          root.lastError = ""
+          console.log("Sonomarchy: another Omarchy shell (pid " + root.standbyShell
+                      + ") runs the Sonos backend; standing by")
+          return
+        }
+        if (text.indexOf("SONOMARCHY_ACTIVE:") === 0) {
+          console.log("Sonomarchy: the other shell released the Sonos backend; starting here")
+          root.standbyShell = ""
+          root.state = "starting"
+          settleTimer.restart()
+          return
+        }
         // pa-dlna's own log lines land here. Every discovery pass makes it
         // complain about unrelated UPnP devices on the LAN (TVs, routers) whose
         // descriptions it cannot parse; that is not our problem and would spam
@@ -210,12 +232,14 @@ Item {
     onStarted: {
       root.healthyThisRun = false
       root.setupError = ""
+      root.standbyShell = ""
       root.zones = ({})
       settleTimer.restart()
     }
 
     onExited: function(exitCode, exitStatus) {
       root.zones = ({})
+      root.standbyShell = ""
       // exitStatus is QProcess.CrashExit (1) when a signal ended it, which is
       // the shape of the backend's own deliberate exit (it SIGTERMs itself) as
       // well as of a real crash; only restartReason separates those two.
@@ -281,6 +305,8 @@ Item {
       // A backend that has run for RESUME-grace seconds without a setup error
       // is healthy even on a network with no Sonos: clear the previous run's
       // failure so status and the restart backoff do not carry it forever.
+      // A standby wrapper is running too, but it is waiting on another
+      // shell's backend, not discovering speakers; it is not "ready".
       if (root.state === "starting" && backend.running && root.setupError === "") {
         root.state = "ready"
         root.healthyThisRun = true

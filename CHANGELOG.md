@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5.5 — 2026-09-13
+
+"Sonomarchy can't start: Another Sonomarchy backend is still running after
+20 s." came back on gus, twice on 2026-09-11 and twice on 2026-09-13. Both
+times the journal shows two Omarchy shells started in the same second. Two
+overlapping `omarchy restart shell` calls each kill the old shell and each
+launch a new one, and each shell loads this service. The first backend took
+the lock; the second one found a holder under a live shell, which 1.5.4
+rightly refuses to kill, waited 20 s, and posted the error.
+
+- Fixed: **a second shell is not a fault.** When the lock is held by a backend
+  under a different live Quickshell, the wrapper now says so once and waits
+  for the lock with no deadline. The service shows `standby` instead of an
+  error and posts nothing. When the other shell's backend stops, this one
+  takes over. If that shell dies hard while we wait, the orphan takeover still
+  runs.
+- Fixed: **a holder still building its venv was invisible.** The lock is taken
+  before the venv build, so on a first start or a requirements change the
+  holder is the bash wrapper, not `sonomarchy.py`, and no holder was found at
+  all. The pid in the lock file is only ever written by the holder, so a
+  wrapper pid found there now counts.
+- Unchanged: a holder under this same shell (a reload still shutting down) is
+  waited for 20 s, and a holder under anything else still produces the error.
+- Added: `tests/test_backend_lock.py` runs the real wrapper against real lock
+  holders under a fake shell: standby then takeover, no standby for a holder
+  under our own parent, and takeover of an orphan while standing by. The
+  wrapper gained `SONOMARCHY_LOCK_ONLY` and `SONOMARCHY_LOCK_WAIT` for these
+  tests; nothing else sets them.
+
 ## 1.5.4 — 2026-09-10
 
 The 20-second OSD from 1.5.3 was still appearing on vic, three times today.
